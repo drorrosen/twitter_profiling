@@ -290,14 +290,37 @@ def load_data(filepath='results/validated_predictions.csv'):
         st.error(f"Error loading data: {e}")
         return None
 
-# Function to get unique traders
+# Function to get unique traders with data cleaning
 def get_traders(df):
-    return sorted(df['author'].unique())
+    # Get all unique authors
+    all_authors = df['author'].unique()
+    
+    # Filter for authors that have parent tweets
+    valid_traders = []
+    for author in all_authors:
+        # Check if author has parent tweets
+        author_data = df[df['author'] == author]
+        parent_tweets = author_data[author_data['tweet_type'] == 'parent']
+        
+        if len(parent_tweets) >= 3:  # Only include traders with at least 3 parent tweets
+            valid_traders.append(author)
+    
+    return sorted(valid_traders)
 
-# Function to filter data for a specific trader
+# Function to filter data for a specific trader with better error handling
 def filter_trader_data(df, trader_name):
     df_user = df[df['author'] == trader_name].copy()
+    
+    if len(df_user) == 0:
+        st.error(f"No data found for trader: {trader_name}")
+        return pd.DataFrame(), pd.DataFrame()
+    
     conv_starter = df_user[df_user['tweet_type'] == 'parent']['conversation_id']
+    
+    if len(conv_starter) == 0:
+        st.warning(f"No parent tweets found for trader: {trader_name}")
+        return df_user, pd.DataFrame()
+    
     df_user = df_user.loc[df_user['conversation_id'].isin(conv_starter)]
     df_parent = df_user[df_user['tweet_type'] == 'parent']
     
@@ -1234,7 +1257,7 @@ def main():
         "and performance metrics. Data is based on validated stock predictions "
         "from Twitter conversations."
     )
-    st.sidebar.markdown("© 2023 Twitter Trader Analysis")
+    st.sidebar.markdown("2025 Twitter Trader Analysis")
 
 # Only show the app if the user has entered the correct password
 if check_password():
