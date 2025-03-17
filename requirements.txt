@@ -5,3 +5,5 @@ matplotlib
 seaborn
 plotly
 datetime
+psycopg2
+hashlib
