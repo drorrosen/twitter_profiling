@@ -10,14 +10,15 @@ import os
 from datetime import datetime, timedelta
 import warnings
 import hashlib
+import psycopg2
 warnings.filterwarnings('ignore')
 
-# Set page configuration
+# Set page configuration - this must be the first Streamlit command
 st.set_page_config(
     page_title="Twitter Trader Analysis",
     page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide",  # Changed from "centered" to "wide" for dashboard views
+    initial_sidebar_state="expanded"  # Changed to expanded for better dashboard navigation
 )
 
 # Function to check login credentials
@@ -34,86 +35,222 @@ def check_password():
             st.session_state["password_correct"] = False
 
     if "password_correct" not in st.session_state:
-        # First run, show inputs for username + password.
+        # For login page, override the layout to be centered
         st.markdown("""
         <style>
-        /* Remove the white container */
-        div.css-1r6slb0.e1tzin5v2 {
-            background-color: transparent;
-            border: none;
-            box-shadow: none;
-        }
-        
-        /* Set page background */
-        .stApp {
-            background-color: #f5f8fa;
-        }
-        
-        .login-container {
-            max-width: 450px;
-            margin: 0 auto;
-            padding: 2.5rem;
-            border-radius: 15px;
-            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15);
-            background-color: white;
-            margin-top: 3rem;
-        }
-        .login-header {
-            text-align: center;
-            margin-bottom: 2rem;
-            color: #1DA1F2;
-            font-size: 2.2rem;
-            font-weight: 700;
-        }
-        .login-subheader {
-            text-align: center;
-            margin-bottom: 2rem;
-            color: #657786;
-            font-size: 1.1rem;
-        }
-        .login-logo {
-            display: block;
-            margin: 0 auto 1.5rem auto;
-            width: 80px;
-            height: 80px;
-        }
-        .stButton > button {
-            background-color: #1DA1F2;
-            color: white;
-            font-weight: bold;
-            border: none;
-            border-radius: 30px;
-            padding: 0.5rem 1rem;
-            width: 100%;
-            margin-top: 1rem;
-        }
-        .stButton > button:hover {
-            background-color: #0c85d0;
-        }
-        .stTextInput > div > div > input {
-            border-radius: 30px;
-            padding: 1rem;
-            border: 1px solid #AAB8C2;
+        /* Center the login form by limiting width */
+        .main .block-container {
+            max-width: 400px;
+            margin-left: auto;
+            margin-right: auto;
         }
         </style>
         """, unsafe_allow_html=True)
         
-        # Use empty to create space at the top
-        st.empty()
+        # Custom CSS to create a clean login page
+        st.markdown("""
+        <style>
+        /* Hide Streamlit elements */
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
         
-        col1, col2, col3 = st.columns([1, 2, 1])
+        /* Make all containers match the background color */
+        .stApp > div, 
+        .stApp > header,
+        .stApp [data-testid="stDecoration"], 
+        .stApp [data-testid="stToolbar"],
+        .stApp [data-testid="stAppViewBlockContainer"] > div:first-child,
+        .stApp [data-testid="stAppViewBlockContainer"] > div,
+        .stApp [data-testid="stVerticalBlock"] > div,
+        .stApp [data-testid="stHorizontalBlock"] > div,
+        .stApp [data-testid="element-container"] > div,
+        .stApp [data-testid="stMarkdown"] > div {
+            background-color: #f0f2f5 !important;
+            border: none !important;
+            box-shadow: none !important;
+        }
         
-        with col2:
-            st.markdown('<div class="login-container">', unsafe_allow_html=True)
-            st.markdown('<img src="https://www.iconpacks.net/icons/2/free-twitter-logo-icon-2429-thumb.png" class="login-logo">', unsafe_allow_html=True)
-            st.markdown('<h1 class="login-header">Twitter Trader Analysis</h1>', unsafe_allow_html=True)
-            st.markdown('<p class="login-subheader">Enter your credentials to access the dashboard</p>', unsafe_allow_html=True)
-            
-            st.text_input("Username", key="username", placeholder="Enter username")
-            st.text_input("Password", type="password", key="password", placeholder="Enter password")
-            st.button("Login", on_click=password_entered)
-            
-            st.markdown('</div>', unsafe_allow_html=True)
+        /* Page background */
+        .stApp {
+            background-color: #f0f2f5;
+        }
+        
+        /* Remove padding */
+        .main .block-container {
+            padding-top: 0 !important;
+            padding-bottom: 2rem;
+            max-width: 400px;
+            margin-top: 0 !important;
+        }
+        
+        /* Login container */
+        .login-container {
+            background-color: white;
+            border-radius: 12px;
+            padding: 2rem;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            margin-top: 2rem;
+        }
+        
+        /* Logo */
+        .logo-container {
+            margin-bottom: 1.5rem;
+            display: flex;
+            justify-content: center;
+            background-color: #f0f2f5; /* Match the background */
+            border-radius: 50%;
+            padding: 10px;
+        }
+        
+        .logo {
+            width: 60px;
+            height: 60px;
+            background-color: #1DA1F2;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        /* Title */
+        .login-title {
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            color: #14171A;
+        }
+        
+        /* Subtitle */
+        .login-subtitle {
+            font-size: 14px;
+            color: #657786;
+            margin-bottom: 1.5rem;
+        }
+        
+        /* Form fields */
+        .form-label {
+            font-size: 14px;
+            font-weight: 600;
+            color: #14171A;
+            text-align: left;
+            display: block;
+            margin-bottom: 0.5rem;
+        }
+        
+        /* Input styling */
+        .stTextInput > div {
+            margin-bottom: 1rem;
+        }
+        
+        .stTextInput > div > div > input {
+            border-radius: 8px;
+            border: 1px solid #E1E8ED;
+            padding: 0.75rem 1rem;
+            font-size: 14px;
+        }
+        
+        /* Button styling */
+        .stButton > button {
+            background-color: #1DA1F2;
+            color: white;
+            border: none;
+            border-radius: 50px;
+            padding: 0.75rem 1rem;
+            font-size: 16px;
+            font-weight: 600;
+            width: 100%;
+            transition: background-color 0.2s;
+        }
+        
+        .stButton > button:hover {
+            background-color: #1a91da;
+        }
+        
+        /* Forgot password */
+        .forgot-password {
+            display: block;
+            text-align: center;
+            color: #1DA1F2;
+            font-size: 14px;
+            margin-top: 1rem;
+            text-decoration: none;
+        }
+        
+        /* Terms text */
+        .terms-text {
+            font-size: 12px;
+            color: #657786;
+            margin-top: 1.5rem;
+            text-align: center;
+        }
+        
+        /* Footer */
+        .footer-text {
+            font-size: 12px;
+            color: #657786;
+            margin-top: 2rem;
+            text-align: center;
+        }
+        
+        /* Links */
+        a {
+            color: #1DA1F2;
+            text-decoration: none;
+        }
+        
+        a:hover {
+            text-decoration: underline;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        # Login container
+        st.markdown('<div class="login-container">', unsafe_allow_html=True)
+        
+        # Logo
+        st.markdown("""
+        <div class="logo-container">
+            <div class="logo">
+                <svg width="30" height="24" viewBox="0 0 24 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M23.643 2.937C22.808 3.307 21.911 3.557 20.968 3.67C21.941 3.08 22.669 2.169 23.016 1.092C22.116 1.628 21.119 2.01 20.058 2.222C19.208 1.319 17.998 0.75 16.658 0.75C14.086 0.75 12 2.836 12 5.408C12 5.776 12.042 6.132 12.12 6.472C8.247 6.277 4.828 4.422 2.529 1.642C2.122 2.339 1.891 3.14 1.891 3.992C1.891 5.595 2.712 7.012 3.96 7.842C3.196 7.82 2.474 7.6 1.84 7.241C1.84 7.26 1.84 7.28 1.84 7.3C1.84 9.558 3.456 11.441 5.592 11.873C5.2 11.98 4.786 12.034 4.36 12.034C4.06 12.034 3.766 12.005 3.484 11.95C4.076 13.801 5.791 15.147 7.832 15.183C6.236 16.433 4.241 17.178 2.075 17.178C1.692 17.178 1.313 17.156 0.942 17.113C3.003 18.436 5.425 19.206 8.022 19.206C16.647 19.206 21.332 12.108 21.332 5.952C21.332 5.752 21.327 5.552 21.318 5.353C22.228 4.682 23.018 3.85 23.641 2.94L23.643 2.937Z" fill="white"/>
+                </svg>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Title and subtitle
+        st.markdown('<h1 class="login-title">Twitter Trader Analysis</h1>', unsafe_allow_html=True)
+        st.markdown('<p class="login-subtitle">Enter your credentials to access the dashboard</p>', unsafe_allow_html=True)
+        
+        # Username field
+        st.markdown('<label class="form-label">Username</label>', unsafe_allow_html=True)
+        username = st.text_input("", key="username", placeholder="Enter username")
+        
+        # Password field
+        st.markdown('<label class="form-label">Password</label>', unsafe_allow_html=True)
+        password = st.text_input("", key="password", type="password", placeholder="Enter password")
+        
+        # Login button
+        st.button("Sign In", on_click=password_entered)
+        
+        # Forgot password link
+        st.markdown('<a href="#" class="forgot-password">Forgot password?</a>', unsafe_allow_html=True)
+        
+        # Terms text
+        st.markdown("""
+        <p class="terms-text">
+            By signing in, you agree to our <a href="#">Terms of Service</a> and <a href="#">Privacy Policy</a>
+        </p>
+        """, unsafe_allow_html=True)
+        
+        # Footer
+        st.markdown('<p class="footer-text">Twitter Trader Analysis v1.0.0 © 2023</p>', unsafe_allow_html=True)
+        
+        # Close container
+        st.markdown('</div>', unsafe_allow_html=True)
+        
         return False
     
     return st.session_state["password_correct"]
@@ -238,87 +375,249 @@ st.markdown("""
         padding: 1rem;
         box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05);
     }
+    .metric-note {
+        font-size: 0.8rem;
+        color: #657786;
+        text-align: center;
+        margin-top: 0.2rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# Function to load data
-@st.cache_data
-def load_data(filepath='results/validated_predictions.csv'):
+# Function to load data from database
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def load_data_from_db():
+    """
+    Load data from the PostgreSQL database using direct psycopg2 connection
+    similar to the approach in db_connection_test.py
+    """
     try:
-        df = pd.read_csv(filepath, low_memory=False)
-        # Convert date columns
-        df['created_date'] = pd.to_datetime(df['created_date'], errors='coerce')
-        df['prediction_date'] = pd.to_datetime(df['prediction_date'], errors='coerce')
-        # Convert selected columns to numeric
-        numeric_columns = [
-            'confidence', 'price_change_pct', 'actual_return',
-            'likes', 'retweets', 'replies_count',
-            'views', 'author_followers', 'author_following'
-        ]
-        df[numeric_columns] = df[numeric_columns].apply(pd.to_numeric, errors='coerce')
+        # Database connection parameters
+        host = "database-twitter.cdh6c6zr5mbr.us-east-1.rds.amazonaws.com"
+        database = "postgres"
+        user = "postgres"
+        password = "DrorMai531"
         
-        # Convert prediction_correct to boolean
-        df['prediction_correct'] = df['prediction_correct'].map(
-            {True: True, 'True': True, 'true': True, 
-             False: False, 'False': False, 'false': False}
+        # Connect to the database
+        conn = psycopg2.connect(
+            host=host,
+            database=database,
+            user=user,
+            password=password,
+            connect_timeout=10
         )
         
-        # Set prediction_correct to None for future predictions
-        df.loc[df['prediction_date'] > pd.Timestamp.today(), 'prediction_correct'] = None
+        # Create a cursor
+        cursor = conn.cursor()
         
-        # Remove conversation IDs where parent tweet has prediction_correct as None
-        conv_to_remove = df[
-            (df['prediction_correct'].isna()) & (df['tweet_type'] == 'parent')
-        ]['conversation_id']
-        df = df[~df['conversation_id'].isin(conv_to_remove)]
+        # Get column names from the database
+        cursor.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'tweets'
+            ORDER BY ordinal_position;
+        """)
+        columns = [row[0] for row in cursor.fetchall()]
         
-        # Remove parent tweets with missing validated ticker
-        df = df[~((df['validated_ticker'].isna()) & (df['tweet_type'] == 'parent'))]
+        # Get total count
+        cursor.execute("SELECT COUNT(*) FROM tweets")
+        total_count = cursor.fetchone()[0]
+        print(f"Total tweets in database: {total_count}")
         
-        # Create a new feature for prediction score - safely handling NaN values
-        def calculate_prediction_score(row):
-            if pd.isna(row['prediction_correct']) or pd.isna(row['price_change_pct']):
-                return None
-            
-            multiplier = 1 if row['prediction_correct'] else -1
-            return abs(float(row['price_change_pct'])) * multiplier
+        # Fetch all data from the tweets table
+        cursor.execute("""
+            SELECT * FROM tweets
+        """)
         
-        df['prediction_score'] = df.apply(calculate_prediction_score, axis=1)
+        # Fetch all rows
+        rows = cursor.fetchall()
+        
+        # Create DataFrame
+        df = pd.DataFrame(rows, columns=columns)
+        
+        # Close cursor and connection
+        cursor.close()
+        conn.close()
+        
+        print(f"Fetched {len(df)} rows from database")
+        print(f"Processed dataframe has {len(df)} rows and columns: {df.columns.tolist()}")
         
         return df
+        
     except Exception as e:
-        st.error(f"Error loading data: {e}")
+        st.error(f"Database connection error: {str(e)}")
+        print(f"Error details: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
+
+# Update the load_data function to filter for actionable tweets
+@st.cache_data
+def load_data(filepath=None):
+    """
+    Load data from the database instead of CSV file
+    """
+    df = load_data_from_db()
+    
+    # Check if the dataframe is empty
+    if df.empty:
+        st.error("Failed to load data from database. Please check the database connection and table structure.")
+        return None
+    
+    try:
+        # Convert date columns
+        date_columns = ['created_at', 'created_date', 'prediction_date', 'start_date', 'end_date']
+        for col in date_columns:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+        
+        # Convert selected columns to numeric
+        numeric_columns = [
+            'likes', 'retweets', 'replies_count', 'views', 
+            'author_followers', 'author_following',
+            'price_change_pct', 'actual_return', 'start_price', 'end_price'
+        ]
+        
+        for col in numeric_columns:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Convert prediction_correct to boolean
+        if 'prediction_correct' in df.columns:
+            df['prediction_correct'] = df['prediction_correct'].map(
+                {True: True, 'True': True, 'true': True, 
+                 False: False, 'False': False, 'false': False}
+            )
+        
+        # Set prediction_correct to None for future predictions
+        if 'prediction_date' in df.columns and 'prediction_correct' in df.columns:
+            df.loc[df['prediction_date'] > pd.Timestamp.today(), 'prediction_correct'] = None
+        
+        # Add tweet_type if missing
+        if 'tweet_type' not in df.columns:
+            df['tweet_type'] = 'parent'  # Assume all are parent tweets if not specified
+        
+        # Add trader column if it doesn't exist
+        if 'trader' not in df.columns:
+            df['trader'] = df['author']
+        
+        # Create a new feature for prediction score - safely handling NaN values
+        if 'prediction_score' not in df.columns and 'prediction_correct' in df.columns and 'price_change_pct' in df.columns:
+            def calculate_prediction_score(row):
+                if pd.isna(row['prediction_correct']) or pd.isna(row['price_change_pct']):
+                    return None
+                
+                multiplier = 1 if row['prediction_correct'] else -1
+                return abs(float(row['price_change_pct'])) * multiplier
+            
+            df['prediction_score'] = df.apply(calculate_prediction_score, axis=1)
+        
+        # FILTER FOR ACTIONABLE TWEETS
+        # 1. Create the full dataset (including all tweets for context)
+        full_df = df.copy()
+        
+        # 2. Filter for parent tweets with actionable sentiment and time horizon
+        actionable_df = df[
+            # Parent tweets only
+            (df['tweet_type'] == 'parent') &
+            # With bullish or bearish sentiment only (not neutral)
+            (df['sentiment'].isin(['bullish', 'bearish'])) &
+            # With a valid time horizon (not empty)
+            (df['time_horizon'].notna() & (df['time_horizon'] != ''))
+        ]
+        
+        # 3. Get all conversations with actionable parent tweets
+        actionable_conv_ids = actionable_df['conversation_id'].unique()
+        
+        # 4. Filter the full dataset to only include tweets from actionable conversations
+        df = full_df[full_df['conversation_id'].isin(actionable_conv_ids)]
+        
+        # Print stats about filtering
+        print(f"Full dataset: {len(full_df)} tweets")
+        print(f"Actionable parent tweets: {len(actionable_df)} tweets")
+        print(f"Filtered dataset (actionable conversations): {len(df)} tweets")
+        
+        return df
+    
+    except Exception as e:
+        st.error(f"Error processing data: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 # Function to get unique traders with data cleaning
 def get_traders(df):
-    # Get all unique authors
-    all_authors = df['author'].unique()
+    """
+    Get unique traders from the author column with proper filtering.
+    """
+    # Check if required columns exist
+    if 'author' not in df.columns:
+        st.error("Author column missing from data")
+        return []
     
-    # Filter for authors that have parent tweets
+    # Get all unique authors (these are our traders)
+    all_authors = df['author'].dropna().unique()
+    
+    # Filter out non-author entries
     valid_traders = []
     for author in all_authors:
-        # Check if author has parent tweets
-        author_data = df[df['author'] == author]
-        parent_tweets = author_data[author_data['tweet_type'] == 'parent']
+        # Skip empty values, numeric values, and ticker symbols
+        if not author or not isinstance(author, str):
+            continue
+            
+        # Skip ticker symbols (usually start with $)
+        if author.startswith('$'):
+            continue
+            
+        # Skip very short names (likely not real users)
+        if len(author) < 2:
+            continue
+            
+        # Skip entries that are just numbers
+        if author.isdigit():
+            continue
         
-        if len(parent_tweets) >= 3:  # Only include traders with at least 3 parent tweets
-            valid_traders.append(author)
+        # Add to valid traders list
+        valid_traders.append(author)
+    
+    # Sort and return the list of valid traders
+    print(f"Found {len(valid_traders)} valid traders out of {len(all_authors)} unique authors")
     
     return sorted(valid_traders)
 
 # Function to filter data for a specific trader with better error handling
-def filter_trader_data(df, trader_name):
+def filter_trader_data(df, trader_name, show_warnings=True):
+    """
+    Filter data for a specific trader.
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        The full dataset
+    trader_name : str
+        Name of the trader to filter for
+    show_warnings : bool, default=True
+        Whether to display warning messages for missing data
+    
+    Returns:
+    --------
+    df_user : pandas.DataFrame
+        DataFrame with all tweets by this trader
+    df_parent : pandas.DataFrame
+        DataFrame with only parent tweets by this trader
+    """
     df_user = df[df['author'] == trader_name].copy()
     
     if len(df_user) == 0:
-        st.error(f"No data found for trader: {trader_name}")
+        if show_warnings:
+            st.error(f"No data found for trader: {trader_name}")
         return pd.DataFrame(), pd.DataFrame()
     
     conv_starter = df_user[df_user['tweet_type'] == 'parent']['conversation_id']
     
     if len(conv_starter) == 0:
-        st.warning(f"No parent tweets found for trader: {trader_name}")
+        if show_warnings:
+            st.warning(f"No parent tweets found for trader: {trader_name}")
         return df_user, pd.DataFrame()
     
     df_user = df_user.loc[df_user['conversation_id'].isin(conv_starter)]
@@ -332,26 +631,67 @@ def filter_trader_data(df, trader_name):
         .map({'true': True, 'false': False})
     )
     
-    # Calculate sentiment consistency per conversation
-    parent_sentiment = df_user[df_user['tweet_type'] == 'parent'][['conversation_id', 'sentiment']].rename(
-        columns={'sentiment': 'parent_sentiment'}
-    )
-    df_user = df_user.merge(parent_sentiment, on='conversation_id', how='left')
-    df_user['consistent_sentiment'] = (df_user['sentiment'] == df_user['parent_sentiment']).astype(int)
-    
-    # Compute Weighted Profitability Score per conversation
-    prediction_score_sum = (
-        df_user.groupby('conversation_id')['prediction_score']
-        .sum()
-        .reset_index(name='Weighted Profitability Score')
-    )
-    df_user = df_user.merge(prediction_score_sum, on='conversation_id', how='left')
+    # Only calculate sentiment consistency if we have parent tweets
+    if len(df_parent) > 0:
+        # Calculate sentiment consistency per conversation
+        parent_sentiment = df_user[df_user['tweet_type'] == 'parent'][['conversation_id', 'sentiment']].rename(
+            columns={'sentiment': 'parent_sentiment'}
+        )
+        df_user = df_user.merge(parent_sentiment, on='conversation_id', how='left')
+        df_user['consistent_sentiment'] = (df_user['sentiment'] == df_user['parent_sentiment']).astype(int)
+        
+        # Compute Weighted Profitability Score per conversation
+        if 'prediction_score' in df_user.columns:
+            prediction_score_sum = (
+                df_user.groupby('conversation_id')['prediction_score']
+                .sum()
+                .reset_index(name='Weighted Profitability Score')
+            )
+            df_user = df_user.merge(prediction_score_sum, on='conversation_id', how='left')
     
     return df_user, df_parent
 
 # Function to compute trader profile summary
 def compute_profile_summary(df_user, df_parent):
-    consistency_by_conv = df_user.groupby('conversation_id')['consistent_sentiment'].mean()
+    # Handle empty dataframes
+    if df_user.empty or df_parent.empty:
+        # Return a default profile summary with N/A values
+        return {
+            "Total Tweets": 0 if df_user.empty else len(df_user),
+            "Total Conversations": 0 if df_user.empty else df_user['conversation_id'].nunique(),
+            "Verified Account": "Unknown",
+            "Followers": 0,
+            "Following": 0,
+            "Most Frequent Time Horizon": "N/A",
+            "Most Frequent Trade Type": "N/A",
+            "Most Frequent Sentiment": "N/A",
+            "Most Mentioned Stock": "N/A",
+            "Average Price Change (%)": 0,
+            "Average Actual Return (%)": 0,
+            "Avg Likes per Tweet": 0,
+            "Avg Retweets per Tweet": 0,
+            "Avg Replies per Tweet": 0,
+            "Avg Views per Tweet": 0,
+            "Prediction Accuracy (%)": "N/A",
+            "Sentiment Consistency per Conversation (%)": 0,
+            "Weighted Profitability Mean": 0,
+        }
+    
+    # Calculate sentiment consistency if the column exists
+    if 'consistent_sentiment' in df_user.columns:
+        consistency_by_conv = df_user.groupby('conversation_id')['consistent_sentiment'].mean()
+        consistency_mean = consistency_by_conv.mean() * 100
+    else:
+        consistency_mean = 0
+    
+    # Calculate weighted profitability if the column exists
+    if 'Weighted Profitability Score' in df_user.columns:
+        weighted_prof_mean = df_user.drop_duplicates(subset='conversation_id')[
+            'Weighted Profitability Score'
+        ].mean()
+    else:
+        weighted_prof_mean = 0
+    
     profile_summary = {
         "Total Tweets": len(df_user),
         "Total Conversations": df_user['conversation_id'].nunique(),
@@ -388,10 +728,8 @@ def compute_profile_summary(df_user, df_parent):
             df_parent['prediction_correct'].mean() * 100
             if not df_parent['prediction_correct'].isna().all() else "N/A"
         ),
-        "Sentiment Consistency per Conversation (%)": consistency_by_conv.mean() * 100,
-        "Weighted Profitability Mean": df_user.drop_duplicates(subset='conversation_id')[
-            'Weighted Profitability Score'
-        ].mean(),
+        "Sentiment Consistency per Conversation (%)": consistency_mean,
+        "Weighted Profitability Mean": weighted_prof_mean,
     }
     return profile_summary
 
@@ -401,7 +739,8 @@ def analyze_all_traders(df):
     trader_metrics = []
     
     for trader in all_traders:
-        df_user, df_parent = filter_trader_data(df, trader)
+        # Set show_warnings=False to avoid showing warnings for each trader
+        df_user, df_parent = filter_trader_data(df, trader, show_warnings=False)
         
         if len(df_parent) < 3:  # Skip traders with too few parent tweets
             continue
@@ -438,40 +777,83 @@ def analyze_all_traders(df):
 
 # Function to create overview dashboard
 def create_overview_dashboard(df):
-    st.markdown('<div class="main-header">Twitter Trader Analysis Dashboard</div>', unsafe_allow_html=True)
+    st.markdown("<h1 class='main-header'>Twitter Trader Analysis Dashboard</h1>", unsafe_allow_html=True)
     
-    # Summary metrics
+    # Get actionable tweets from traders with at least 3 parent tweets
+    valid_traders = []
+    invalid_traders = []
+    
+    # Find traders with at least 3 actionable parent tweets
+    for trader in get_traders(df):
+        # Count actionable parent tweets for this trader
+        count = len(df[(df['author'] == trader) & 
+                       (df['tweet_type'] == 'parent') & 
+                       (df['sentiment'].isin(['bullish', 'bearish'])) &
+                       (df['time_horizon'].notna() & (df['time_horizon'] != ''))])
+        
+        if count >= 3:
+            valid_traders.append(trader)
+        else:
+            invalid_traders.append(trader)
+    
+    # Filter dataframe to only include valid traders
+    filtered_df = df[df['author'].isin(valid_traders)]
+    
+    # Get parent tweets for statistics
+    parent_tweets = filtered_df[filtered_df['tweet_type'] == 'parent']
+    
+    # Get metrics
+    unique_traders = len(valid_traders)
+    total_tweets = len(filtered_df)
+    
+    # Calculate accuracy and return only from parent tweets of valid traders 
+    # with non-null prediction_correct values
+    accuracy_df = parent_tweets[parent_tweets['prediction_correct'].notna()]
+    overall_accuracy = accuracy_df['prediction_correct'].mean() * 100 if len(accuracy_df) > 0 else 0
+    
+    # Calculate average return from parent tweets
+    avg_return = parent_tweets['actual_return'].mean() if 'actual_return' in parent_tweets.columns else 0
+    
+    # Display metrics
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-value">{len(df["author"].unique())}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value neutral">{unique_traders}</div>', unsafe_allow_html=True)
         st.markdown('<div class="metric-label">Unique Traders</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
     
     with col2:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-value">{len(df)}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value neutral">{total_tweets:,}</div>', unsafe_allow_html=True)
         st.markdown('<div class="metric-label">Total Tweets</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
     
     with col3:
-        accuracy = df[df['prediction_correct'].notna()]['prediction_correct'].mean() * 100
-        color_class = "positive" if accuracy > 50 else "negative"
+        accuracy_class = "positive" if overall_accuracy > 50 else "negative"
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-value {color_class}">{accuracy:.1f}%</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value {accuracy_class}">{overall_accuracy:.1f}%</div>', unsafe_allow_html=True)
         st.markdown('<div class="metric-label">Overall Accuracy</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
     
     with col4:
-        avg_return = df[df['actual_return'].notna()]['actual_return'].mean()
-        color_class = "positive" if avg_return > 0 else "negative"
+        return_class = "positive" if avg_return > 0 else "negative"
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-value {color_class}">{avg_return:.2f}%</div>', unsafe_allow_html=True)
-        st.markdown('<div class="metric-label">Average Return</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value {return_class}">{avg_return:.2f}%</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Average Return (per prediction)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-note">Based on actual price movement during prediction period</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
     
-    # Analyze all traders
+    # Optional: Add an expandable section with filtered traders info instead of warnings
+    with st.expander("Show traders with insufficient data"):
+        st.info(f"{len(invalid_traders)} traders were filtered out due to having fewer than 3 actionable tweets.")
+        if invalid_traders:
+            st.write("Traders excluded from analysis:")
+            chunks = [invalid_traders[i:i+5] for i in range(0, len(invalid_traders), 5)]
+            for chunk in chunks:
+                st.write(", ".join(chunk))
+    
+    # Analyze all traders (this already filters to traders with 3+ tweets)
     trader_metrics = analyze_all_traders(df)
     
     # Top traders section
@@ -536,23 +918,44 @@ def create_overview_dashboard(df):
     
     with col1:
         # Sentiment distribution
-        sentiment_counts = df['sentiment'].value_counts().reset_index()
-        sentiment_counts.columns = ['Sentiment', 'Count']
-        
-        colors = {'bullish': '#17BF63', 'bearish': '#E0245E', 'neutral': '#AAB8C2'}
-        
+        all_parent_tweets = filtered_df[filtered_df['tweet_type'] == 'parent']
+        sentiment_counts = all_parent_tweets['sentiment'].value_counts()
+        sentiment_pcts = sentiment_counts / sentiment_counts.sum() * 100
+
+        # Create a color map that includes neutral
+        sentiment_colors = {
+            'bullish': '#17BF63',   # Green
+            'bearish': '#E0245E',   # Red
+            'neutral': '#AAB8C2',   # Grey
+            'unknown': '#F5F8FA'    # Light grey
+        }
+
+        # Create the pie chart with all sentiment values
         fig = px.pie(
-            sentiment_counts,
-            values='Count',
-            names='Sentiment',
-            color='Sentiment',
-            color_discrete_map=colors,
-            title='Overall Sentiment Distribution'
+            values=sentiment_pcts,
+            names=sentiment_pcts.index,
+            title="Overall Sentiment Distribution",
+            color=sentiment_pcts.index,
+            color_discrete_map=sentiment_colors,
+            hole=0.4
         )
-        
-        fig.update_traces(textposition='inside', textinfo='percent+label')
-        fig.update_layout(height=400)
-        
+
+        # Update layout
+        fig.update_layout(
+            legend_title="Sentiment",
+            margin=dict(t=30, b=0, l=0, r=0),
+            height=400,
+            font=dict(size=14)
+        )
+
+        # Add percentage labels
+        fig.update_traces(
+            textposition='inside',
+            textinfo='percent+label',
+            insidetextfont=dict(color='white')
+        )
+
+        # Display the chart
         st.plotly_chart(fig, use_container_width=True)
     
     with col2:
@@ -687,6 +1090,55 @@ def create_trader_profile(df, trader_name):
     # Header with trader info
     st.markdown(f'<div class="main-header">Trader Profile: {trader_name}</div>', unsafe_allow_html=True)
     
+    # Check if we have any parent tweets after filtering
+    if len(df_parent) == 0:
+        st.warning(f"No actionable parent tweets found for {trader_name}. Unable to generate detailed profile.")
+        
+        # Show basic stats if available
+        if len(df_user) > 0:
+            st.markdown("### Basic Information")
+            st.markdown(f"**Total Tweets:** {profile_summary['Total Tweets']}")
+            
+            if profile_summary['Followers'] > 0:
+                st.markdown(f"**Followers:** {profile_summary['Followers']:,}")
+            
+            if profile_summary['Following'] > 0:
+                st.markdown(f"**Following:** {profile_summary['Following']:,}")
+            
+            st.markdown("### Note")
+            st.markdown(
+                "This trader does not have any parent tweets that meet the actionable criteria. "
+                "Actionable tweets must be parent tweets with bullish or bearish sentiment and a defined time horizon."
+            )
+        return
+    
+    # Check if we have enough parent tweets for reliable analysis
+    if len(df_parent) < 3:
+        st.warning(f"Insufficient data for reliable analysis. {trader_name} has only {len(df_parent)} actionable parent tweets.")
+        
+        # Show basic stats
+        st.markdown("### Basic Information")
+        st.markdown(f"**Total Tweets:** {profile_summary['Total Tweets']}")
+        st.markdown(f"**Actionable Parent Tweets:** {len(df_parent)}")
+        st.markdown(f"**Conversations:** {profile_summary['Total Conversations']}")
+        
+        if profile_summary['Followers'] > 0:
+            st.markdown(f"**Followers:** {profile_summary['Followers']:,}")
+        
+        if profile_summary['Following'] > 0:
+            st.markdown(f"**Following:** {profile_summary['Following']:,}")
+        
+        if profile_summary['Most Mentioned Stock'] != "N/A":
+            st.markdown(f"**Most Mentioned Stock:** {profile_summary['Most Mentioned Stock']}")
+        
+        st.markdown("### Note")
+        st.markdown(
+            "This trader does not have enough actionable parent tweets for reliable analysis. "
+            "We recommend at least 3 actionable tweets to generate meaningful metrics."
+        )
+        return
+    
+    # Continue with the normal profile display for traders with sufficient actionable tweets
     # Profile summary cards
     col1, col2, col3, col4 = st.columns(4)
     
@@ -779,19 +1231,28 @@ def create_trader_profile(df, trader_name):
         
         with col1:
             # Time Horizon distribution
-            time_horizon_counts = df_parent['time_horizon'].value_counts(normalize=True) * 100
-            
-            fig = px.pie(
-                values=time_horizon_counts.values,
-                names=time_horizon_counts.index,
-                title='Time Horizon Distribution',
+            time_horizon_counts = df_parent['time_horizon'].value_counts()
+            time_horizon_pcts = time_horizon_counts / time_horizon_counts.sum() * 100
+
+            # Remove 'unknown' or empty values for visualization if they somehow exist
+            if '' in time_horizon_pcts.index:
+                time_horizon_pcts = time_horizon_pcts.drop('')
+            if 'unknown' in time_horizon_pcts.index:
+                time_horizon_pcts = time_horizon_pcts.drop('unknown')
+
+            # Create the pie chart with valid time horizons only
+            fig1 = px.pie(
+                values=time_horizon_pcts,
+                names=time_horizon_pcts.index,
+                title="Time Horizon Distribution",
+                color=time_horizon_pcts.index,
                 color_discrete_sequence=px.colors.qualitative.Pastel
             )
             
-            fig.update_traces(textposition='inside', textinfo='percent+label')
-            fig.update_layout(height=350)
+            fig1.update_traces(textposition='inside', textinfo='percent+label')
+            fig1.update_layout(height=350)
             
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig1, use_container_width=True)
         
         with col2:
             # Trade Type distribution
@@ -1221,13 +1682,216 @@ def create_trader_profile(df, trader_name):
             bottom_performing['Price Change (%)'] = bottom_performing['Price Change (%)'].round(2)
             st.dataframe(bottom_performing, use_container_width=True)
 
+# Function to create raw data dashboard
+def create_raw_data_dashboard(df):
+    """
+    Create a dashboard to explore the raw data.
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        The dataframe containing the data to explore.
+    """
+    st.markdown("<h1 class='main-header'>Raw Data Explorer</h1>", unsafe_allow_html=True)
+    
+    # Create tabs for raw data and statistics
+    tabs = st.tabs(["Raw Data", "Data Statistics"])
+    
+    # Raw Data tab
+    with tabs[0]:
+        st.markdown("<h2 class='sub-header'>Raw Data</h2>", unsafe_allow_html=True)
+        
+        # Add filters for the raw data
+        col1, col2, col3 = st.columns(3)
+        
+        # Check for author column (traders)
+        with col1:
+            if 'author' in df.columns:
+                authors = ["All"] + sorted(df["author"].unique().tolist())
+                selected_author = st.selectbox("Filter by Trader", authors)
+            else:
+                selected_author = "All"
+                st.info("No author column found in the data")
+        
+        # Check for ticker column and extract first ticker from each entry if comma-separated
+        with col2:
+            if 'tickers_mentioned' in df.columns:
+                # Extract first ticker from comma-separated lists
+                first_tickers = df['tickers_mentioned'].apply(lambda x: x.split(',')[0].strip() if isinstance(x, str) and ',' in x else x)
+                tickers = ["All"] + sorted(first_tickers.unique().tolist())
+                selected_ticker = st.selectbox("Filter by Ticker", tickers)
+            elif 'ticker' in df.columns:
+                tickers = ["All"] + sorted(df["ticker"].unique().tolist())
+                selected_ticker = st.selectbox("Filter by Ticker", tickers)
+            else:
+                selected_ticker = "All"
+                st.info("No ticker column found in the data")
+        
+        # Date filter
+        with col3:
+            dates = ["All", "Last 7 Days", "Last 30 Days", "Last 90 Days", "Last 365 Days"]
+            selected_date = st.selectbox("Filter by Date", dates, key="date_filter")
+        
+        # Apply filters
+        filtered_df = df.copy()
+        
+        # Apply author filter
+        if selected_author != "All":
+            if 'author' in df.columns:
+                filtered_df = filtered_df[filtered_df["author"] == selected_author]
+        
+        # Apply ticker filter - check if ticker is in any position in comma-separated list
+        if selected_ticker != "All":
+            if 'tickers_mentioned' in df.columns:
+                # Filter rows where the selected ticker appears in the comma-separated list
+                filtered_df = filtered_df[filtered_df['tickers_mentioned'].apply(
+                    lambda x: selected_ticker in [t.strip() for t in x.split(',')] if isinstance(x, str) else False
+                )]
+            elif 'ticker' in df.columns:
+                filtered_df = filtered_df[filtered_df["ticker"] == selected_ticker]
+        
+        # Apply date filter using the max date in the dataset
+        if selected_date != "All":
+            # Find date columns
+            date_columns = []
+            for col in df.columns:
+                if 'date' in col.lower() or col.lower() == 'date':
+                    date_columns.append(col)
+            
+            if date_columns:
+                # Use the first found date column
+                date_col = date_columns[0]
+                
+                # Get max date from the dataset
+                max_date = df[date_col].max()
+                
+                days = int(selected_date.split()[1])
+                cutoff_date = max_date - timedelta(days=days)
+                
+                filtered_df = filtered_df[filtered_df[date_col] >= cutoff_date]
+        
+        # Show the filtered dataframe
+        st.dataframe(filtered_df, use_container_width=True)
+        
+        # Download button for the filtered data
+        csv = filtered_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Download Filtered Data as CSV",
+            data=csv,
+            file_name=f"twitter_trader_data_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+        )
+    
+    # Data Statistics tab
+    with tabs[1]:
+        st.markdown("<h2 class='sub-header'>Data Statistics</h2>", unsafe_allow_html=True)
+        
+        # Create a dashboard of statistics for the data
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.markdown("<h3>Numerical Statistics</h3>", unsafe_allow_html=True)
+            
+            # Select only numerical columns for statistics
+            num_cols = df.select_dtypes(include=['float64', 'int64']).columns.tolist()
+            if num_cols:
+                num_stats = df[num_cols].describe().T
+                num_stats = num_stats.reset_index()
+                num_stats.columns = ['Column', 'Count', 'Mean', 'Std', 'Min', '25%', '50%', '75%', 'Max']
+                st.dataframe(num_stats, use_container_width=True)
+            else:
+                st.info("No numerical columns found in the dataset.")
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.markdown("<h3>Categorical Statistics</h3>", unsafe_allow_html=True)
+            
+            # Select categorical columns
+            cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+            
+            if cat_cols:
+                selected_cat_col = st.selectbox("Select Categorical Column", cat_cols)
+                
+                # Calculate value counts
+                val_counts = df[selected_cat_col].value_counts().reset_index()
+                val_counts.columns = [selected_cat_col, 'Count']
+                
+                # Create a horizontal bar chart
+                fig = px.bar(
+                    val_counts.head(20), 
+                    x='Count', 
+                    y=selected_cat_col,
+                    orientation='h',
+                    title=f'Top 20 Values in {selected_cat_col}',
+                    color='Count',
+                    color_continuous_scale='blues'
+                )
+                
+                fig.update_layout(
+                    height=600,
+                    xaxis_title='Count',
+                    yaxis_title=selected_cat_col,
+                    yaxis={'categoryorder':'total ascending'}
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No categorical columns found in the dataset.")
+                
+            st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Additional statistics
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("<h3>Dataset Summary</h3>", unsafe_allow_html=True)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Total Records", f"{len(df):,}")
+        
+        with col2:
+            # Check for author column (traders)
+            if 'author' in df.columns:
+                st.metric("Number of Traders", f"{df['author'].nunique():,}")
+            else:
+                st.metric("Number of Traders", "N/A")
+        
+        with col3:
+            # Check for ticker column
+            if 'ticker' in df.columns:
+                st.metric("Number of Tickers", f"{df['ticker'].nunique():,}")
+            elif 'tickers_mentioned' in df.columns:
+                st.metric("Number of Tickers", f"{df['tickers_mentioned'].nunique():,}")
+            else:
+                st.metric("Number of Tickers", "N/A")
+        
+        with col4:
+            # Find date columns
+            date_columns = []
+            for col in df.columns:
+                if 'date' in col.lower() or col.lower() == 'date':
+                    date_columns.append(col)
+            
+            if date_columns:
+                # Use the first found date column
+                date_col = date_columns[0]
+                date_range = f"{df[date_col].min().date()} to {df[date_col].max().date()}"
+                st.metric("Date Range", date_range)
+            else:
+                st.metric("Date Range", "N/A")
+            
+        st.markdown("</div>", unsafe_allow_html=True)
+
 # Main app
 def main():
     # Load data
     df = load_data()
     
-    if df is None:
-        st.error("Failed to load data. Please check the data file path.")
+    if df is None or df.empty:
+        st.error("Failed to load data. Please check the database connection and table structure.")
         return
     
     # Sidebar
@@ -1237,17 +1901,19 @@ def main():
     st.sidebar.image("https://www.iconpacks.net/icons/2/free-twitter-logo-icon-2429-thumb.png", width=100)
     
     # Dashboard selection
-    dashboard = st.sidebar.radio("Select Dashboard", ["Overview", "Trader Profile"])
+    dashboard = st.sidebar.radio("Select Dashboard", ["Overview", "Trader Profile", "Raw Data Explorer"])
     
     if dashboard == "Overview":
         create_overview_dashboard(df)
-    else:
+    elif dashboard == "Trader Profile":
         # Trader selection
         traders = get_traders(df)
         selected_trader = st.sidebar.selectbox("Select Trader", traders)
         
         # Display trader profile
         create_trader_profile(df, selected_trader)
+    else:  # Raw Data Explorer
+        create_raw_data_dashboard(df)
     
     # Footer
     st.sidebar.markdown("---")
