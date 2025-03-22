@@ -5,3 +5,11 @@ matplotlib
 seaborn
 plotly
 psycopg2-binary
+apify-client
+yfinance
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+python-dotenv
+openai
