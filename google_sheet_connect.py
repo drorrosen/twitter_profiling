@@ -12,17 +12,24 @@ SERVICE_ACCOUNT_FILE = 'tweet-individuals.json'
 
 def connect_to_sheets():
     try:
-        # Create credentials using service account
-        creds = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        # Try to get credentials from Streamlit secrets first
+        try:
+            import streamlit as st
+            creds_info = st.secrets["gcp_service_account"]
+            creds = service_account.Credentials.from_service_account_info(
+                creds_info, scopes=SCOPES)
+        except:
+            # Fall back to file if available
+            creds = service_account.Credentials.from_service_account_file(
+                SERVICE_ACCOUNT_FILE, scopes=SCOPES)
 
         # Build the Sheets API service
         service = build('sheets', 'v4', credentials=creds)
         
         return service
 
-    except HttpError as err:
-        print(f"An error occurred: {err}")
+    except Exception as err:
+        print(f"An error occurred connecting to Google Sheets: {err}")
         return None
 
 def get_sheet_data(spreadsheet_id, range_name):
