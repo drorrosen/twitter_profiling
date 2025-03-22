@@ -24,6 +24,73 @@ import concurrent.futures
 import traceback
 import io
 
+# Set page config FIRST - before any other Streamlit commands
+st.set_page_config(
+    page_title="Twitter Trader Analysis",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Now add custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        color: #1DA1F2;
+        font-size: 2.5rem;
+        font-weight: 700;
+        margin-bottom: 1rem;
+        text-align: center;
+    }
+    .card {
+        background-color: #ffffff;
+        border-radius: 10px;
+        padding: 20px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+    }
+    .metric-card {
+        background-color: #f8f9fa;
+        border-left: 4px solid #1DA1F2;
+        padding: 15px;
+        border-radius: 5px;
+        margin-bottom: 15px;
+    }
+    .metric-value {
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #1DA1F2;
+    }
+    .metric-label {
+        font-size: 0.9rem;
+        color: #6c757d;
+    }
+    .stButton > button {
+        background-color: #1DA1F2;
+        color: white;
+        border: none;
+        border-radius: 5px;
+        padding: 10px 15px;
+        font-weight: 500;
+    }
+    .stButton > button:hover {
+        background-color: #0c85d0;
+    }
+    .sidebar-header {
+        margin-bottom: 20px;
+        text-align: center;
+    }
+    .sidebar-footer {
+        position: fixed;
+        bottom: 0;
+        padding: 10px;
+        width: 100%;
+        background-color: #f8f9fa;
+        border-top: 1px solid #e9ecef;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 def extract_handles_directly():
     """Extract Twitter handles directly from Google Sheet."""
     try:
@@ -118,78 +185,6 @@ except Exception as e:
     
     def upload_to_database(df):
         return False
-
-# Add this to the top of your file, after the imports
-def set_page_config():
-    """Configure the Streamlit page with custom styling and layout"""
-    st.set_page_config(
-        page_title="Twitter Trader Analysis",
-        page_icon="📊",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
-    # Custom CSS for better styling
-    st.markdown("""
-    <style>
-    .main-header {
-        color: #1DA1F2;
-        font-size: 2.5rem;
-        font-weight: 700;
-        margin-bottom: 1rem;
-        text-align: center;
-    }
-    .card {
-        background-color: #ffffff;
-        border-radius: 10px;
-        padding: 20px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        margin-bottom: 20px;
-    }
-    .metric-card {
-        background-color: #f8f9fa;
-        border-left: 4px solid #1DA1F2;
-        padding: 15px;
-        border-radius: 5px;
-        margin-bottom: 15px;
-    }
-    .metric-value {
-        font-size: 1.8rem;
-        font-weight: 700;
-        color: #1DA1F2;
-    }
-    .metric-label {
-        font-size: 0.9rem;
-        color: #6c757d;
-    }
-    .stButton > button {
-        background-color: #1DA1F2;
-        color: white;
-        border: none;
-        border-radius: 5px;
-        padding: 10px 15px;
-        font-weight: 500;
-    }
-    .stButton > button:hover {
-        background-color: #0c85d0;
-    }
-    .sidebar-header {
-        margin-bottom: 20px;
-        text-align: center;
-    }
-    .sidebar-footer {
-        position: fixed;
-        bottom: 0;
-        padding: 10px;
-        width: 100%;
-        background-color: #f8f9fa;
-        border-top: 1px solid #e9ecef;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-# Call this at the beginning of your main function
-set_page_config()
 
 # Function to check login credentials
 def check_password():
@@ -2649,16 +2644,22 @@ def main():
     
     # Sidebar navigation
     st.sidebar.title("Navigation")
+    
+    # Add logo or image
+    st.sidebar.image("https://www.iconpacks.net/icons/2/free-twitter-logo-icon-2429-thumb.png", width=100)
+    
     page = st.sidebar.radio(
         "Select a page",
-        ["Overview", "Trader Profiles", "Raw Data", "Data Extraction"]
+        ["Dashboard", "Trader Profile", "Raw Data", "Data Extraction"]
     )
     
     # Load data only when needed (not for Data Extraction page)
     if page != "Data Extraction":
         try:
             # Try loading from database first
-            df = load_data_from_db()
+            df = load_data()
+            st.session_state.df = df
+            
             if df is None or df.empty:
                 st.warning("No data available in database. Please extract data first.")
                 page = "Data Extraction"
@@ -2666,19 +2667,20 @@ def main():
             st.error(f"Error loading data: {str(e)}")
             page = "Data Extraction"
     
-    # Page routing
-    if page == "Overview":
+    # Display the selected page
+    if page == "Dashboard":
         if st.session_state.df is not None:
             create_overview_dashboard(st.session_state.df)
         else:
             st.warning("Please extract data first using the Data Extraction page.")
-    elif page == "Trader Profiles":
+    elif page == "Trader Profile":
         if st.session_state.df is not None:
-            trader_name = st.sidebar.selectbox(
-                "Select Trader",
-                get_traders(st.session_state.df)
-            )
-            create_trader_profile(st.session_state.df, trader_name)
+            # Trader selection
+            traders = get_traders(st.session_state.df)
+            selected_trader = st.sidebar.selectbox("Select Trader", traders)
+            
+            # Display trader profile
+            create_trader_profile(st.session_state.df, selected_trader)
         else:
             st.warning("Please extract data first using the Data Extraction page.")
     elif page == "Raw Data":
@@ -2691,10 +2693,15 @@ def main():
     
     # Footer
     st.sidebar.markdown("---")
-    st.sidebar.markdown("Made with ❤️ by Your Team")
+    st.sidebar.markdown("### About")
+    st.sidebar.info(
+        "This dashboard analyzes Twitter traders' prediction accuracy "
+        "and performance metrics. Data is based on validated stock predictions "
+        "from Twitter conversations."
+    )
+    st.sidebar.markdown("2025 Twitter Trader Analysis")
 
-# Update the app entry point
+# Only show the app if the user has entered the correct password
 if __name__ == "__main__":
-    set_page_config()
     if check_password():
         main()
