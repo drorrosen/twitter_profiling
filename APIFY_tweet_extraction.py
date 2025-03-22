@@ -343,10 +343,6 @@ def process_current_tweets(scraper, twitter_handles, period="daily"):
     # Extract tweets
     tweets = scraper.extract_tweets(run_input)
     
-    # Save results with appropriate file names
-    scraper.save_to_csv(tweets, f'tweets_{file_suffix}.csv')
-    scraper.save_to_json(tweets, f'tweets_{file_suffix}.json')
-    
     return tweets
 
 def load_processed_handles():
@@ -443,10 +439,6 @@ def process_historical_tweets_for_new_handles(scraper, all_handles, processed_ha
     # Extract tweets
     tweets = scraper.extract_tweets(run_input)
     
-    # Save results
-    scraper.save_to_csv(tweets, 'tweets_new_handles.csv')
-    scraper.save_to_json(tweets, 'tweets_new_handles.json')
-    
     # Add the new handles to the processed list
     processed_handles.extend(new_handles)
     save_processed_handles(processed_handles)
@@ -476,10 +468,6 @@ def process_historical_tweets(scraper, twitter_handles):
     
     # Extract tweets
     tweets = scraper.extract_tweets(run_input)
-    
-    # Save results
-    scraper.save_to_csv(tweets, 'tweets_historical.csv')
-    scraper.save_to_json(tweets, 'tweets_historical.json')
     
     return tweets
 
@@ -543,7 +531,6 @@ def main():
     # Combine all tweets and save to organized_tweets.csv
     all_tweets = current_tweets + new_historical_tweets
     if all_tweets:
-        scraper.save_to_csv(all_tweets, 'organized_tweets.csv')
         print(f"Total tweets processed: {len(all_tweets)}")
     else:
         print("No new tweets processed")
