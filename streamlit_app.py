@@ -11,378 +11,280 @@ from datetime import datetime, timedelta
 import warnings
 import hashlib
 import psycopg2
-warnings.filterwarnings('ignore')
+import sys
+import subprocess
+import time
+import threading
+import json
+from io import StringIO
+import importlib.util
+import csv
+from apify_client import ApifyClient
+import concurrent.futures
+import traceback
+import io
 
-# Set page configuration - this must be the first Streamlit command
-st.set_page_config(
-    page_title="Twitter Trader Analysis",
-    page_icon="📊",
-    layout="wide",  # Changed from "centered" to "wide" for dashboard views
-    initial_sidebar_state="expanded"  # Changed to expanded for better dashboard navigation
-)
+def extract_handles_directly():
+    """Extract Twitter handles directly from Google Sheet."""
+    try:
+        # Import directly from google_sheet_connect.py
+        from google_sheet_connect import get_sheet_data, extract_username
+        
+        # Use the correct spreadsheet ID
+        SPREADSHEET_ID = '1e7qzNwQv7NCuT9coefCy7v1WtSV5b_FKW6TLy-3b25o'
+        RANGE_NAME = 'Sheet1!A1:B'  # Remove the row limit to get all rows
+        
+        print(f"Attempting to connect to Google Sheet with ID: {SPREADSHEET_ID}")
+        
+        # Get sheet data
+        data = get_sheet_data(SPREADSHEET_ID, RANGE_NAME)
+        
+        if not data:
+            print("❌ Failed to retrieve data from Google Sheet")
+            return [], []
+        
+        print(f"✅ Successfully connected to Google Sheet")
+        print(f"Retrieved {len(data)} rows from Google Sheet")
+        
+        # Debug: Print all rows to verify we're getting the complete data
+        print("\nDebug: All rows in sheet:")
+        for i, row in enumerate(data):
+            print(f"Row {i}: {row}")
+        
+        # Extract handles
+        twitter_handles = []
+        twitter_lists = []
+        seen_handles = set()  # To prevent duplicates
+        
+        # Process Twitter Lists (Column A)
+        for row in data[1:]:  # Skip header row
+            if row and len(row) > 0 and row[0]:  # If there's a value in the first column
+                list_id = extract_username(row[0])
+                if list_id:
+                    twitter_lists.append(list_id)
+                    print(f"Added list: {list_id}")
+        
+        # Process Individual Accounts (Column B)
+        for row in data[1:]:  # Skip header row
+            if row and len(row) > 1 and row[1]:  # If there's a value in the second column
+                username = extract_username(row[1])
+                if username and username.lower() not in seen_handles:
+                    twitter_handles.append(username)
+                    seen_handles.add(username.lower())
+                    print(f"Added handle: {username}")
+        
+        print(f"Extracted {len(twitter_handles)} Twitter handles from column B")
+        print(f"Extracted {len(twitter_lists)} Twitter lists from column A")
+        
+        return twitter_handles, twitter_lists
+        
+    except Exception as e:
+        print(f"❌ Error in extract_handles_directly: {e}")
+        print("Please check the Google Sheet connection and make sure the service account has access.")
+        return [], []  # Return empty lists instead of raising an exception
+
+# Set environment variables for the prediction process
+os.environ['FILTER_BY_TIME_HORIZON'] = 'True'
+os.environ['FILTER_BY_TICKER_COUNT'] = 'True'
+os.environ['MAX_TICKERS'] = '5'  # Default value, can be overridden by UI
+
+# Import twitter-predictions.py using importlib
+try:
+    # Use importlib to load the module with a hyphen in the name
+    spec = importlib.util.spec_from_file_location("twitter_predictions", "twitter-predictions.py")
+    twitter_predictions = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(twitter_predictions)
+    
+    # Get the required functions
+    filter_actionable_tweets = twitter_predictions.filter_actionable_tweets
+    add_market_validation_columns = twitter_predictions.add_market_validation_columns
+    analyze_user_accuracy = twitter_predictions.analyze_user_accuracy
+    upload_to_database = twitter_predictions.upload_to_database
+    
+    print("Successfully imported twitter-predictions.py module")
+except Exception as e:
+    print(f"Error importing twitter predictions module: {e}")
+    
+    # Define placeholder functions
+    def filter_actionable_tweets(df):
+        st.error(f"Failed to import twitter-predictions.py: {e}")
+        return {"actionable_tweets": pd.DataFrame(), "analysis_tweets": pd.DataFrame()}
+    
+    def add_market_validation_columns(df, all_tweets=None, output_dir=None):
+        return pd.DataFrame()
+    
+    def analyze_user_accuracy(df, min_tweets=5):
+        return pd.DataFrame()
+    
+    def upload_to_database(df):
+        return False
+
+# Add this to the top of your file, after the imports
+def set_page_config():
+    """Configure the Streamlit page with custom styling and layout"""
+    st.set_page_config(
+        page_title="Twitter Trader Analysis",
+        page_icon="📊",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Custom CSS for better styling
+    st.markdown("""
+    <style>
+    .main-header {
+        color: #1DA1F2;
+        font-size: 2.5rem;
+        font-weight: 700;
+        margin-bottom: 1rem;
+        text-align: center;
+    }
+    .card {
+        background-color: #ffffff;
+        border-radius: 10px;
+        padding: 20px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+    }
+    .metric-card {
+        background-color: #f8f9fa;
+        border-left: 4px solid #1DA1F2;
+        padding: 15px;
+        border-radius: 5px;
+        margin-bottom: 15px;
+    }
+    .metric-value {
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #1DA1F2;
+    }
+    .metric-label {
+        font-size: 0.9rem;
+        color: #6c757d;
+    }
+    .stButton > button {
+        background-color: #1DA1F2;
+        color: white;
+        border: none;
+        border-radius: 5px;
+        padding: 10px 15px;
+        font-weight: 500;
+    }
+    .stButton > button:hover {
+        background-color: #0c85d0;
+    }
+    .sidebar-header {
+        margin-bottom: 20px;
+        text-align: center;
+    }
+    .sidebar-footer {
+        position: fixed;
+        bottom: 0;
+        padding: 10px;
+        width: 100%;
+        background-color: #f8f9fa;
+        border-top: 1px solid #e9ecef;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# Call this at the beginning of your main function
+set_page_config()
 
 # Function to check login credentials
 def check_password():
     """Returns `True` if the user had the correct password."""
-
+    
     def password_entered():
         """Checks whether a password entered by the user is correct."""
+        # Hardcoded credentials - replace with a more secure method in production
         if st.session_state["username"] == "TwitterProfiling" and st.session_state["password"] == "Twitter135":
             st.session_state["password_correct"] = True
             del st.session_state["password"]  # Don't store password
             del st.session_state["username"]  # Don't store username
         else:
             st.session_state["password_correct"] = False
-
+    
     if "password_correct" not in st.session_state:
-        # For login page, override the layout to be centered
+        # First run, show inputs for username + password.
         st.markdown("""
         <style>
-        /* Center the login form by limiting width */
-        .main .block-container {
-            max-width: 400px;
-            margin-left: auto;
-            margin-right: auto;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-        
-        # Custom CSS to create a clean login page
-        st.markdown("""
-        <style>
-        /* Hide Streamlit elements */
-        #MainMenu {visibility: hidden;}
-        footer {visibility: hidden;}
-        header {visibility: hidden;}
-        
-        /* Make all containers match the background color */
-        .stApp > div, 
-        .stApp > header,
-        .stApp [data-testid="stDecoration"], 
-        .stApp [data-testid="stToolbar"],
-        .stApp [data-testid="stAppViewBlockContainer"] > div:first-child,
-        .stApp [data-testid="stAppViewBlockContainer"] > div,
-        .stApp [data-testid="stVerticalBlock"] > div,
-        .stApp [data-testid="stHorizontalBlock"] > div,
-        .stApp [data-testid="element-container"] > div,
-        .stApp [data-testid="stMarkdown"] > div {
-            background-color: #f0f2f5 !important;
-            border: none !important;
-            box-shadow: none !important;
-        }
-        
-        /* Page background */
-        .stApp {
-            background-color: #f0f2f5;
-        }
-        
-        /* Remove padding */
-        .main .block-container {
-            padding-top: 0 !important;
-            padding-bottom: 2rem;
-            max-width: 400px;
-            margin-top: 0 !important;
-        }
-        
-        /* Login container */
         .login-container {
+            max-width: 400px;
+            margin: 0 auto;
+            padding: 40px;
             background-color: white;
-            border-radius: 12px;
-            padding: 2rem;
+            border-radius: 10px;
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
             text-align: center;
-            margin-top: 2rem;
         }
-        
-        /* Logo */
-        .logo-container {
-            margin-bottom: 1.5rem;
-            display: flex;
-            justify-content: center;
-            background-color: #f0f2f5; /* Match the background */
-            border-radius: 50%;
-            padding: 10px;
-        }
-        
-        .logo {
+        .login-logo {
             width: 60px;
-            height: 60px;
-            background-color: #1DA1F2;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            margin-bottom: 20px;
         }
-        
-        /* Title */
         .login-title {
             font-size: 24px;
             font-weight: 700;
-            margin-bottom: 0.5rem;
-            color: #14171A;
+            color: #1DA1F2;
+            margin-bottom: 5px;
         }
-        
-        /* Subtitle */
         .login-subtitle {
             font-size: 14px;
             color: #657786;
-            margin-bottom: 1.5rem;
+            margin-bottom: 30px;
         }
-        
-        /* Form fields */
         .form-label {
             font-size: 14px;
-            font-weight: 600;
+            font-weight: 500;
             color: #14171A;
             text-align: left;
             display: block;
-            margin-bottom: 0.5rem;
+            margin-bottom: 8px;
         }
-        
-        /* Input styling */
-        .stTextInput > div {
-            margin-bottom: 1rem;
-        }
-        
-        .stTextInput > div > div > input {
-            border-radius: 8px;
-            border: 1px solid #E1E8ED;
-            padding: 0.75rem 1rem;
-            font-size: 14px;
-        }
-        
-        /* Button styling */
         .stButton > button {
             background-color: #1DA1F2;
             color: white;
-            border: none;
-            border-radius: 50px;
-            padding: 0.75rem 1rem;
-            font-size: 16px;
             font-weight: 600;
+            border: none;
+            padding: 10px 0;
+            border-radius: 30px;
+            margin-top: 20px;
             width: 100%;
-            transition: background-color 0.2s;
+            transition: background-color 0.3s;
         }
-        
         .stButton > button:hover {
             background-color: #1a91da;
-        }
-        
-        /* Forgot password */
-        .forgot-password {
-            display: block;
-            text-align: center;
-            color: #1DA1F2;
-            font-size: 14px;
-            margin-top: 1rem;
-            text-decoration: none;
-        }
-        
-        /* Terms text */
-        .terms-text {
-            font-size: 12px;
-            color: #657786;
-            margin-top: 1.5rem;
-            text-align: center;
-        }
-        
-        /* Footer */
-        .footer-text {
-            font-size: 12px;
-            color: #657786;
-            margin-top: 2rem;
-            text-align: center;
-        }
-        
-        /* Links */
-        a {
-            color: #1DA1F2;
-            text-decoration: none;
-        }
-        
-        a:hover {
-            text-decoration: underline;
         }
         </style>
         """, unsafe_allow_html=True)
         
-        # Login container
-        st.markdown('<div class="login-container">', unsafe_allow_html=True)
+        # Center the login form
+        col1, col2, col3 = st.columns([1, 2, 1])
         
-        # Logo
-        st.markdown("""
-        <div class="logo-container">
-            <div class="logo">
-                <svg width="30" height="24" viewBox="0 0 24 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M23.643 2.937C22.808 3.307 21.911 3.557 20.968 3.67C21.941 3.08 22.669 2.169 23.016 1.092C22.116 1.628 21.119 2.01 20.058 2.222C19.208 1.319 17.998 0.75 16.658 0.75C14.086 0.75 12 2.836 12 5.408C12 5.776 12.042 6.132 12.12 6.472C8.247 6.277 4.828 4.422 2.529 1.642C2.122 2.339 1.891 3.14 1.891 3.992C1.891 5.595 2.712 7.012 3.96 7.842C3.196 7.82 2.474 7.6 1.84 7.241C1.84 7.26 1.84 7.28 1.84 7.3C1.84 9.558 3.456 11.441 5.592 11.873C5.2 11.98 4.786 12.034 4.36 12.034C4.06 12.034 3.766 12.005 3.484 11.95C4.076 13.801 5.791 15.147 7.832 15.183C6.236 16.433 4.241 17.178 2.075 17.178C1.692 17.178 1.313 17.156 0.942 17.113C3.003 18.436 5.425 19.206 8.022 19.206C16.647 19.206 21.332 12.108 21.332 5.952C21.332 5.752 21.327 5.552 21.318 5.353C22.228 4.682 23.018 3.85 23.641 2.94L23.643 2.937Z" fill="white"/>
-                </svg>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Title and subtitle
-        st.markdown('<h1 class="login-title">Twitter Trader Analysis</h1>', unsafe_allow_html=True)
-        st.markdown('<p class="login-subtitle">Enter your credentials to access the dashboard</p>', unsafe_allow_html=True)
-        
-        # Username field
-        st.markdown('<label class="form-label">Username</label>', unsafe_allow_html=True)
-        username = st.text_input("", key="username", placeholder="Enter username")
-        
-        # Password field
-        st.markdown('<label class="form-label">Password</label>', unsafe_allow_html=True)
-        password = st.text_input("", key="password", type="password", placeholder="Enter password")
-        
-        # Login button
-        st.button("Sign In", on_click=password_entered)
-        
-        # Forgot password link
-        st.markdown('<a href="#" class="forgot-password">Forgot password?</a>', unsafe_allow_html=True)
-        
-        # Terms text
-        st.markdown("""
-        <p class="terms-text">
-            By signing in, you agree to our <a href="#">Terms of Service</a> and <a href="#">Privacy Policy</a>
-        </p>
-        """, unsafe_allow_html=True)
-        
-        # Footer
-        st.markdown('<p class="footer-text">Twitter Trader Analysis v1.0.0 © 2023</p>', unsafe_allow_html=True)
-        
-        # Close container
-        st.markdown('</div>', unsafe_allow_html=True)
+        with col2:
+            st.markdown('<div class="login-container">', unsafe_allow_html=True)
+            
+            # Logo and title
+            st.markdown(f'<img src="https://www.iconpacks.net/icons/2/free-twitter-logo-icon-2429-thumb.png" class="login-logo">', unsafe_allow_html=True)
+            st.markdown('<h1 class="login-title">Twitter Trader Analysis</h1>', unsafe_allow_html=True)
+            st.markdown('<p class="login-subtitle">Enter your credentials to access the dashboard</p>', unsafe_allow_html=True)
+            
+            # Username field
+            st.markdown('<label class="form-label">Username</label>', unsafe_allow_html=True)
+            username = st.text_input("Username", key="username", placeholder="Enter username", label_visibility="collapsed")
+            
+            # Password field
+            st.markdown('<label class="form-label">Password</label>', unsafe_allow_html=True)
+            password = st.text_input("Password", key="password", type="password", placeholder="Enter password", label_visibility="collapsed")
+            
+            # Login button
+            st.button("Sign In", on_click=password_entered)
+            
+            st.markdown('</div>', unsafe_allow_html=True)
         
         return False
     
     return st.session_state["password_correct"]
-
-# Custom CSS for styling
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.8rem;
-        color: #1DA1F2;
-        font-weight: 800;
-        margin-bottom: 1.5rem;
-        text-align: center;
-        padding-bottom: 1rem;
-        border-bottom: 2px solid #F5F8FA;
-    }
-    .sub-header {
-        font-size: 1.8rem;
-        color: #14171A;
-        font-weight: 600;
-        margin-top: 1.5rem;
-        margin-bottom: 1rem;
-        padding-left: 0.5rem;
-        border-left: 4px solid #1DA1F2;
-    }
-    .card {
-        border-radius: 15px;
-        padding: 1.8rem;
-        background-color: white;
-        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.08);
-        margin-bottom: 1.5rem;
-        transition: transform 0.3s ease, box-shadow 0.3s ease;
-    }
-    .card:hover {
-        transform: translateY(-5px);
-        box-shadow: 0 8px 15px rgba(0, 0, 0, 0.1);
-    }
-    .metric-value {
-        font-size: 2.5rem;
-        font-weight: 800;
-        color: #1DA1F2;
-        text-align: center;
-    }
-    .metric-label {
-        font-size: 1.1rem;
-        color: #657786;
-        text-align: center;
-        margin-top: 0.5rem;
-    }
-    .positive {
-        color: #17BF63;
-    }
-    .negative {
-        color: #E0245E;
-    }
-    .neutral {
-        color: #AAB8C2;
-    }
-    .highlight {
-        background-color: #F5F8FA;
-        padding: 1rem;
-        border-radius: 10px;
-        border-left: 5px solid #1DA1F2;
-        margin-bottom: 1rem;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 2rem;
-        border-bottom: 2px solid #F5F8FA;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 4rem;
-        white-space: pre-wrap;
-        background-color: transparent;
-        border-radius: 4px 4px 0px 0px;
-        gap: 1rem;
-        padding-top: 0.5rem;
-        padding-bottom: 0.5rem;
-        font-weight: 600;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #F5F8FA;
-        border-bottom: 3px solid #1DA1F2;
-    }
-    .stDataFrame {
-        border-radius: 10px;
-        overflow: hidden;
-    }
-    .stDataFrame [data-testid="stTable"] {
-        border-radius: 10px;
-    }
-    /* Sidebar styling */
-    .css-1d391kg {
-        background-color: #F5F8FA;
-    }
-    .css-1v3fvcr {
-        background-color: #FFFFFF;
-    }
-    /* Make the app background slightly off-white for better contrast */
-    .main .block-container {
-        background-color: #FAFAFA;
-        padding: 2rem;
-        border-radius: 15px;
-    }
-    /* Style the plotly charts */
-    .js-plotly-plot {
-        border-radius: 10px;
-        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.05);
-        background-color: white;
-        padding: 1rem;
-    }
-    /* Style the selectbox */
-    .stSelectbox > div > div > div {
-        background-color: white;
-        border-radius: 30px;
-        padding: 0.2rem 1rem;
-        border: 1px solid #AAB8C2;
-    }
-    /* Style the radio buttons */
-    .stRadio > div {
-        background-color: white;
-        border-radius: 10px;
-        padding: 1rem;
-        box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05);
-    }
-    .metric-note {
-        font-size: 0.8rem;
-        color: #657786;
-        text-align: center;
-        margin-top: 0.2rem;
-    }
-</style>
-""", unsafe_allow_html=True)
 
 # Function to load data from database
 @st.cache_data(ttl=3600)  # Cache for 1 hour
@@ -778,6 +680,46 @@ def analyze_all_traders(df):
 # Function to create overview dashboard
 def create_overview_dashboard(df):
     st.markdown("<h1 class='main-header'>Twitter Trader Analysis Dashboard</h1>", unsafe_allow_html=True)
+    
+    # Summary metrics
+    st.markdown("<h2>Key Metrics</h2>", unsafe_allow_html=True)
+    
+    metric_cols = st.columns(4)
+    
+    with metric_cols[0]:
+        st.markdown("""
+        <div class="metric-card">
+            <div class="metric-value">{}</div>
+            <div class="metric-label">Total Traders</div>
+        </div>
+        """.format(df['author'].nunique()), unsafe_allow_html=True)
+    
+    with metric_cols[1]:
+        st.markdown("""
+        <div class="metric-card">
+            <div class="metric-value">{}</div>
+            <div class="metric-label">Total Predictions</div>
+        </div>
+        """.format(len(df)), unsafe_allow_html=True)
+    
+    with metric_cols[2]:
+        correct_preds = df[df['prediction_correct'] == True].shape[0]
+        accuracy = correct_preds / len(df) * 100 if len(df) > 0 else 0
+        st.markdown("""
+        <div class="metric-card">
+            <div class="metric-value">{:.1f}%</div>
+            <div class="metric-label">Overall Accuracy</div>
+        </div>
+        """.format(accuracy), unsafe_allow_html=True)
+    
+    with metric_cols[3]:
+        avg_return = df['actual_return'].mean() if 'actual_return' in df.columns else 0
+        st.markdown("""
+        <div class="metric-card">
+            <div class="metric-value">{:.2f}%</div>
+            <div class="metric-label">Avg. Return</div>
+        </div>
+        """.format(avg_return), unsafe_allow_html=True)
     
     # Get actionable tweets from traders with at least 3 parent tweets
     valid_traders = []
@@ -1885,35 +1827,844 @@ def create_raw_data_dashboard(df):
             
         st.markdown("</div>", unsafe_allow_html=True)
 
+# Function to load the twitter-llm-optimized module dynamically
+def load_twitter_llm_module():
+    try:
+        # Dynamically import the twitter-llms-optimized.py module
+        spec = importlib.util.spec_from_file_location("twitter_llm", "twitter-llms-optimized.py")
+        twitter_llm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(twitter_llm)
+        return twitter_llm
+    except Exception as e:
+        st.error(f"Error loading Twitter LLM module: {str(e)}")
+        return None
+
+# Add a new function for the data extraction dashboard
+def create_data_extraction_dashboard():
+    # Initialize session state variables if they don't exist
+    if 'twitter_data' not in st.session_state:
+        st.session_state.twitter_data = None
+    if 'processed_data' not in st.session_state:  # Add this line
+        st.session_state.processed_data = None
+    
+    st.markdown("<h1 class='main-header'>Twitter Data Extraction Dashboard</h1>", unsafe_allow_html=True)
+    
+    # Create a cleaner layout with two columns
+    col1, col2 = st.columns([3, 2])
+    
+    with col1:
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("<h3 style='color: #1DA1F2; margin-bottom: 15px;'>Run Tweet Extraction</h3>", unsafe_allow_html=True)
+        
+        # Add options for extraction in a more compact layout
+        extraction_options_col1, extraction_options_col2 = st.columns(2)
+        
+        with extraction_options_col1:
+            sample_mode = st.checkbox("Sample Mode (100 tweets)", value=True, 
+                                     help="Enable to fetch only 100 tweets for testing")
+        
+        with extraction_options_col2:
+            extraction_type = st.radio(
+                "Extraction Type",
+                [
+                    "Daily Only", 
+                    "Weekly (Last 7 Days)",  # Add this new option
+                    "New Handles Only", 
+                    "Complete Extraction"
+                ],
+                index=0
+            )
+        
+        # Create a container for the button to control its width
+        button_col1, button_col2, button_col3 = st.columns([1, 2, 1])
+        
+        with button_col2:
+            # Add a more prominent button to run the extraction with consistent styling
+            if st.button("🚀 Start Tweet Extraction", type="primary"):
+                # Create a placeholder for the log output
+                log_output = st.empty()
+                
+                # Show a progress message
+                st.markdown("""
+                <div style="padding: 10px; background-color: #f8f9fa; border-radius: 5px; margin-top: 10px;">
+                    <p style="margin: 0; color: #1DA1F2;"><strong>⏳ Initializing extraction process...</strong></p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Function to capture and display output
+                def run_extraction_with_logs():
+                    """Run the tweet extraction process and capture logs"""
+                    # Redirect stdout to capture logs
+                    old_stdout = sys.stdout
+                    sys.stdout = mystdout = StringIO()
+                    
+                    try:
+                        # Set environment variables based on user selections
+                        os.environ["SAMPLE_MODE"] = "True" if sample_mode else "False"
+                        print(f"🔧 Sample mode: {'Enabled (100 tweets)' if sample_mode else 'Disabled (100,000 tweets)'}")
+                        os.environ["EXTRACTION_TYPE"] = extraction_type
+                        
+                        # Get handles from Google Sheet directly - no fallbacks
+                        twitter_handles, twitter_lists = extract_handles_directly()
+                        
+                        if not twitter_handles:
+                            print("❌ No Twitter handles found. Please check the Google Sheet connection.")
+                            return mystdout.getvalue(), 0
+                        
+                        print(f"✅ Using {len(twitter_handles)} Twitter handles for processing")
+                        
+                        # Initialize scraper using the existing TwitterScraper class
+                        from APIFY_tweet_extraction import TwitterScraper
+                        
+                        # API token from the existing code
+                        api_token = "apify_api_kdevcdwOVQ5K4HugmeLYlaNgaxeOGG3dkcwc"
+                        scraper = TwitterScraper(api_token)
+                        
+                        # Set max_items based on sample mode
+                        max_items = 100 if sample_mode else 100000
+                        
+                        # Initialize scraper using the existing TwitterScraper class
+                        from APIFY_tweet_extraction import TwitterScraper
+                        
+                        # API token from the existing code
+                        api_token = "apify_api_kdevcdwOVQ5K4HugmeLYlaNgaxeOGG3dkcwc"
+                        scraper = TwitterScraper(api_token)
+                        
+                        # Update the prepare_input method's default max_items
+                        scraper.prepare_input = lambda *args, **kwargs: {
+                            "startUrls": kwargs.get('start_urls', []),
+                            "searchTerms": kwargs.get('search_terms', []),
+                            "twitterHandles": kwargs.get('twitter_handles', []),
+                            "conversationIds": kwargs.get('conversation_ids', []),
+                            "maxItems": max_items,  # Use our max_items here
+                            "sort": "Latest",
+                            "tweetLanguage": "en"
+                        }
+                        
+                        # For "New Handles Only" extraction type, we need to get existing authors from the database
+                        if extraction_type == "New Handles Only":
+                            print("🔍 New Handles Only mode selected - checking database for existing authors...")
+                            
+                            try:
+                                # Get existing authors from the database
+                                from APIFY_tweet_extraction import get_existing_authors_from_db
+                                existing_authors = get_existing_authors_from_db()
+                                
+                                # Filter for new handles (not in database)
+                                new_handles = [handle for handle in twitter_handles if handle.lower() not in existing_authors]
+                                
+                                print(f"✅ Found {len(existing_authors)} existing authors in database")
+                                print(f"✅ Found {len(twitter_handles)} total handles from Google Sheet")
+                                print(f"🆕 Identified {len(new_handles)} new handles for extraction")
+                                
+                                # Print only the new handles that aren't in the database
+                                if new_handles:
+                                    print("\n📋 New handles that will be processed:")
+                                    for handle in new_handles:
+                                        print(f"  • {handle}")
+                                    
+                                    # Import and use the process_historical_tweets_for_new_handles function
+                                    from APIFY_tweet_extraction import process_historical_tweets_for_new_handles, load_processed_handles
+                                    
+                                    # Load the list of handles that have already been processed historically
+                                    processed_handles = load_processed_handles()
+                                    print(f"Previously processed {len(processed_handles)} handles historically")
+                                    
+                                    # Process historical tweets for new handles
+                                    new_historical_tweets = process_historical_tweets_for_new_handles(
+                                        scraper, new_handles, processed_handles)
+                                    print(f"Processed {len(new_historical_tweets)} historical tweets for new handles")
+                                    
+                                    # Then apply the limit after getting the tweets
+                                    if new_historical_tweets:
+                                        df = pd.DataFrame(new_historical_tweets)
+                                        if len(df) > max_items:
+                                            df = df.head(max_items)
+                                            print(f"✅ {'Sample' if sample_mode else 'Full'} mode: Limited to {len(df)} tweets")
+                                        else:
+                                            print(f"✅ Processing {len(df)} tweets")
+                                        
+                                        # Store in session state
+                                        st.session_state.twitter_data = df
+                                        tweet_count = len(df)
+                                        print(f"✅ Stored {tweet_count} tweets in session state for processing")
+                                        return mystdout.getvalue(), tweet_count
+                                    else:
+                                        print("❌ No new tweets were retrieved")
+                                        return mystdout.getvalue(), 0
+                                
+                            except Exception as e:
+                                print(f"❌ Error checking for new handles: {str(e)}")
+                                print("⚠️ Unable to process without valid handles")
+                                return mystdout.getvalue(), 0
+                        
+                        elif extraction_type == "Daily Only":
+                            os.environ["EXTRACTION_TYPE"] = "daily"
+                            period = "daily"
+                            print("🔍 DEBUG: Running DAILY ONLY extraction")
+                            print(f"🔍 DEBUG: EXTRACTION_TYPE={os.environ['EXTRACTION_TYPE']}, period={period}")
+                            
+                            # Import and use the process_current_tweets function
+                            from APIFY_tweet_extraction import process_current_tweets
+                            
+                            # Process current tweets (daily) for all handles
+                            print("🔍 DEBUG: Calling process_current_tweets with period='daily'")
+                            current_tweets = process_current_tweets(
+                                scraper, twitter_handles, period=period)
+                            print(f"🔍 DEBUG: Returned {len(current_tweets)} tweets from process_current_tweets")
+                            
+                            # Convert to dataframe
+                            if current_tweets:
+                                df = pd.DataFrame(current_tweets)
+                                
+                                # Apply sample mode if enabled
+                                if sample_mode and len(df) > 100:
+                                    df = df.head(100)
+                                    print(f"✅ Sample mode: Limited to {len(df)} tweets")
+                                elif not sample_mode and len(df) > 100000:  # Add this condition
+                                    df = df.head(100000)
+                                    print(f"✅ Full mode: Limited to {len(df)} tweets")
+                                else:
+                                    print(f"✅ Processing {len(df)} tweets")
+                                
+                                # Store in session state
+                                st.session_state.twitter_data = df
+                                tweet_count = len(df)
+                                print(f"✅ Stored {tweet_count} tweets in session state for processing")
+                                return mystdout.getvalue(), tweet_count
+                            else:
+                                print("❌ No tweets were retrieved")
+                                return mystdout.getvalue(), 0
+                        
+                        elif extraction_type == "Weekly (Last 7 Days)":  # Handle the new option
+                            os.environ["EXTRACTION_TYPE"] = "weekly"
+                            period = "weekly"
+                            # Import and use the process_current_tweets function
+                            from APIFY_tweet_extraction import process_current_tweets
+                            
+                            # Process current tweets (weekly) for all handles
+                            current_tweets = process_current_tweets(
+                                scraper, twitter_handles, period=period)
+                            print(f"Processed {len(current_tweets)} current tweets")
+                            
+                            # Convert to dataframe
+                            if current_tweets:
+                                df = pd.DataFrame(current_tweets)
+                                
+                                # Apply sample mode if enabled
+                                if sample_mode and len(df) > 100:
+                                    df = df.head(100)
+                                    print(f"✅ Sample mode: Limited to {len(df)} tweets")
+                                elif not sample_mode and len(df) > 100000:  # Add this condition
+                                    df = df.head(100000)
+                                    print(f"✅ Full mode: Limited to {len(df)} tweets")
+                                else:
+                                    print(f"✅ Processing {len(df)} tweets")
+                                
+                                # Store in session state
+                                st.session_state.twitter_data = df
+                                tweet_count = len(df)
+                                print(f"✅ Stored {tweet_count} tweets in session state for processing")
+                                return mystdout.getvalue(), tweet_count
+                            else:
+                                print("❌ No tweets were retrieved")
+                                return mystdout.getvalue(), 0
+                        
+                        elif extraction_type == "Complete Extraction":
+                            os.environ["EXTRACTION_TYPE"] = "complete"
+                            period = "daily"  # Default to daily for complete extraction
+                            # Import process_current_tweets and process_historical_tweets
+                            from APIFY_tweet_extraction import process_current_tweets, process_historical_tweets
+                            
+                            # Process both current and historical tweets
+                            current_tweets = process_current_tweets(
+                                scraper, twitter_handles, period=period)
+                            print(f"Processed {len(current_tweets)} current tweets")
+                            
+                            historical_tweets = process_historical_tweets(
+                                scraper, twitter_handles)
+                            print(f"Processed {len(historical_tweets)} historical tweets")
+                            
+                            # Combine all tweets
+                            all_tweets = current_tweets + historical_tweets
+                            
+                            # Convert to dataframe
+                            if all_tweets:
+                                df = pd.DataFrame(all_tweets)
+                                
+                                # Apply sample mode if enabled
+                                if sample_mode and len(df) > 100:
+                                    df = df.head(100)
+                                    print(f"✅ Sample mode: Limited to {len(df)} tweets")
+                                elif not sample_mode and len(df) > 100000:  # Add this condition
+                                    df = df.head(100000)
+                                    print(f"✅ Full mode: Limited to {len(df)} tweets")
+                                else:
+                                    print(f"✅ Processing {len(df)} tweets")
+                                
+                                # Store in session state
+                                st.session_state.twitter_data = df
+                                tweet_count = len(df)
+                                print(f"✅ Stored {tweet_count} tweets in session state for processing")
+                                return mystdout.getvalue(), tweet_count
+                            else:
+                                print("❌ No tweets were retrieved")
+                                return mystdout.getvalue(), 0
+                        
+                    except Exception as e:
+                        print(f"Error during extraction: {str(e)}")
+                        import traceback
+                        traceback.print_exc(file=mystdout)
+                        return mystdout.getvalue(), 0
+                    finally:
+                        # Restore stdout
+                        sys.stdout = old_stdout
+                    
+                    return mystdout.getvalue(), 0
+                
+                # Run in a separate thread to avoid blocking the UI
+                with st.spinner("Running tweet extraction... This may take a few minutes."):
+                    # Execute the extraction
+                    logs, tweet_count = run_extraction_with_logs()
+                    
+                    # Format the logs with syntax highlighting and better styling
+                    formatted_logs = logs.replace("\n", "<br>")
+                    formatted_logs = formatted_logs.replace("✅", "<span style='color: #17BF63'>✅</span>")
+                    formatted_logs = formatted_logs.replace("❌", "<span style='color: #E0245E'>❌</span>")
+                    formatted_logs = formatted_logs.replace("⚠️", "<span style='color: #FFAD1F'>⚠️</span>")
+                    formatted_logs = formatted_logs.replace("🔄", "<span style='color: #1DA1F2'>🔄</span>")
+                    formatted_logs = formatted_logs.replace("🆕", "<span style='color: #17BF63'>🆕</span>")
+                    formatted_logs = formatted_logs.replace("📊", "<span style='color: #794BC4'>📊</span>")
+                    formatted_logs = formatted_logs.replace("📝", "<span style='color: #1DA1F2'>📝</span>")
+                    
+                    # Display the logs in a scrollable area with better styling
+                    log_output.markdown(f"""
+                    <div class='log-container' style='background-color: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 8px; font-family: "Consolas", monospace; line-height: 1.5; max-height: 500px; overflow-y: auto;'>
+                        {formatted_logs}
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Show completion message
+                    if tweet_count > 0:
+                        st.success(f"Tweet extraction completed successfully! Extracted {tweet_count} tweets.")
+                    else:
+                        st.warning("Tweet extraction completed but no tweets were found.")
+        
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    with col2:
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("<h3 style='color: #1DA1F2; margin-bottom: 15px;'>Twitter Handles</h3>", unsafe_allow_html=True)
+        
+        # Get Twitter handles from Google Sheet
+        try:
+            twitter_handles, twitter_lists = extract_handles_directly()
+            
+            # Create a more visually appealing success message
+            st.markdown(f"""
+            <div style="background-color: #E8F5E9; padding: 10px; border-radius: 5px; margin-bottom: 15px;">
+                <p style="margin: 0; color: #2E7D32;"><strong>✅ Found {len(twitter_handles)} Twitter handles in Google Sheet</strong></p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            
+        except Exception as e:
+            st.error(f"Error fetching Twitter handles: {str(e)}")
+        
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Add a section for data processing with a cleaner design
+    st.markdown("<h2 class='sub-header'>Data Processing & Database Upload</h2>", unsafe_allow_html=True)
+    
+    # Create two columns for processing and upload
+    process_col, upload_col = st.columns(2)
+    
+    with process_col:
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("<h3 style='color: #1DA1F2; margin-bottom: 15px;'>Process Tweets</h3>", unsafe_allow_html=True)
+        
+        # Check if we have data in session state
+        if st.session_state.twitter_data is not None:
+            st.markdown(f"""
+            <div style="background-color: #E8F5E9; padding: 10px; border-radius: 5px; margin-bottom: 15px;">
+                <p style="margin: 0; color: #2E7D32;"><strong>✅ Tweets available for processing</strong></p>
+                <p style="margin-top: 5px; color: #2E7D32;">Ready to process {len(st.session_state.twitter_data)} tweets with LLM analysis</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Add OpenAI API key input
+            openai_api_key = st.text_input(
+                "OpenAI API Key", 
+                type="password",
+                help="Enter your OpenAI API key to use for LLM processing",
+                placeholder="sk-..."
+            )
+            
+            # Add a slider to select the number of parallel workers
+            num_workers = st.slider(
+                "Number of parallel workers", 
+                min_value=1, 
+                max_value=16, 
+                value=8,  # Default to 8 workers
+                help="Higher values may process faster but use more resources"
+            )
+            
+            # Add a note about worker selection
+            st.info(f"""
+            💡 **Worker Configuration:**
+            - Using {num_workers} parallel workers for processing
+            - More workers = faster processing but higher resource usage
+            - Recommended: 4-8 workers for most systems
+            """)
+            
+            # Process button
+            if st.button("🧠 Process with LLM", use_container_width=True, disabled=not openai_api_key):
+                if not openai_api_key:
+                    st.error("Please enter your OpenAI API key to continue.")
+                else:
+                    try:
+                        # Check if we have data in session state
+                        if 'twitter_data' not in st.session_state or st.session_state.twitter_data is None:
+                            st.error("❌ No data in session state! Please run extraction first.")
+                            return
+                        
+                        # Get the data
+                        df = st.session_state.twitter_data
+                        
+                        # Create progress indicators
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        # Setup OpenAI client
+                        import openai
+                        client = openai.OpenAI(api_key=openai_api_key)
+                        
+                        # Get user-selected number of workers
+                        num_workers = st.session_state.get("num_workers", 8)  # Default to 8 if not set
+                        
+                        # Define the process_tweet function - using EXACT same prompt as in twitter-llms-optimized.py
+                        def process_tweet(tweet_data):
+                            try:
+                                # Extract tweet text
+                                text = tweet_data.get('text', '')
+                                if not text:
+                                    text = tweet_data.get('fullText', '')
+                                
+                                # Process with OpenAI - USING THE EXACT SAME PROMPT AND MODEL
+                                response = client.chat.completions.create(
+                                    model="gpt-4o-mini",  # Use the same model
+                                    messages=[
+                                        {"role": "system", "content": """
+                                        You are a financial market analyst. Analyze the given tweet and return your analysis in JSON format.
+                                        Your response should be a valid JSON object with the following structure:
+                                        {
+                                            "time_horizon": "intraday/daily/weekly/short_term/medium_term/long_term/unknown",
+                                            "trade_type": "trade_suggestion/analysis/news/general_discussion/unknown",
+                                            "sentiment": "bullish/bearish/neutral"
+                                        }
+
+                                        Guidelines for classification:
+                                        1. Time horizon:
+                                           - intraday: within the same trading day or mentions "today"
+                                           - daily: 1-5 trading days, mentions "tomorrow", "next day", or this week
+                                           - weekly: 1-4 weeks, mentions "next week" or specific dates within a month
+                                           - short_term: 1-3 months, mentions "next month", " next quarter"
+                                           - medium_term: 3-6 months, mentions "quarter", or "Q1/Q2/Q3/Q4, "end of year"
+                                           - long_term: >6 months, mentions "next year" or longer timeframes
+                                           - unknown: if not specified
+                                           
+                                           IMPORTANT: Pay close attention to time-related words like "today", "tomorrow", "next week", etc.
+                                           If the tweet mentions earnings or events happening "tomorrow", classify as "daily".
+                                        
+                                        2. Type of content:
+                                           - trade_suggestion: specific entry/exit points or direct trade recommendations
+                                           - analysis: market analysis, chart patterns, fundamentals
+                                           - news: market news, company updates, economic data, earnings announcements
+                                           - general_discussion: general market talk
+                                           - unknown: if unclear
+                                        
+                                        3. Market sentiment:
+                                           - bullish: positive outlook, expecting upward movement
+                                           - bearish: negative outlook, expecting downward movement
+                                           - neutral: balanced view or no clear direction
+                                        """},
+                                        {"role": "user", "content": text}
+                                    ],
+                                    response_format={"type": "json_object"}  # Ensure JSON response
+                                )
+                                
+                                # Parse response
+                                llm_response = response.choices[0].message.content
+                                
+                                # Extract tweet author data if available
+                                author_info = tweet_data.get('author', {})
+                                author_name = author_info.get('userName', '') if isinstance(author_info, dict) else ''
+                                
+                                # Create result record
+                                result = {
+                                    'id': tweet_data.get('id', ''),
+                                    'text': text,
+                                    'author': author_name,
+                                    'created_at': tweet_data.get('createdAt', ''),
+                                    'llm_response': llm_response,
+                                }
+                                
+                                # Parse JSON response (should be valid JSON already due to response_format)
+                                try:
+                                    import json
+                                    data = json.loads(llm_response)
+                                    
+                                    # Add structured fields
+                                    result['time_horizon'] = data.get('time_horizon', 'unknown')
+                                    result['trade_type'] = data.get('trade_type', 'unknown')
+                                    result['sentiment'] = data.get('sentiment', 'neutral')
+                                except Exception as json_err:
+                                    print(f"Error parsing JSON: {json_err}")
+                                
+                                return result
+                            except Exception as e:
+                                return {
+                                    'id': tweet_data.get('id', ''),
+                                    'text': tweet_data.get('text', ''),
+                                    'error': str(e)
+                                }
+                        
+                        # Now process all tweets with parallel execution
+                        import concurrent.futures
+                        import time
+                        
+                        # Convert DataFrame to list of dictionaries for processing
+                        tweets_to_process = df.to_dict('records')
+                        total_tweets = len(tweets_to_process)
+                        
+                        status_text.text(f"Processing {total_tweets} tweets with {num_workers} workers...")
+                        
+                        start_time = time.time()
+                        processed_tweets = []
+                        completed = 0
+                        
+                        # Process in parallel
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                            # Submit all tweets for processing
+                            future_to_tweet = {executor.submit(process_tweet, tweet): tweet for tweet in tweets_to_process}
+                            
+                            # Process as they complete
+                            for future in concurrent.futures.as_completed(future_to_tweet):
+                                result = future.result()
+                                processed_tweets.append(result)
+                                
+                                # Update progress
+                                completed += 1
+                                progress = completed / total_tweets
+                                progress_bar.progress(progress)
+                                elapsed = time.time() - start_time
+                                tweets_per_second = completed / elapsed if elapsed > 0 else 0
+                                remaining = (total_tweets - completed) / tweets_per_second if tweets_per_second > 0 else 0
+                                
+                                # Update status every few tweets to avoid UI slowdown
+                                if completed % 5 == 0 or completed == total_tweets:
+                                    status_text.text(
+                                        f"Processed: {completed}/{total_tweets} tweets ({int(progress*100)}%) | "
+                                        f"Speed: {tweets_per_second:.1f} tweets/sec | "
+                                        f"Est. remaining: {int(remaining)} seconds"
+                                    )
+                        
+                        # Create DataFrame from results
+                        processed_df = pd.DataFrame(processed_tweets)
+                        
+                        # Store in session state
+                        st.session_state.processed_data = processed_df
+                        
+                        # Clear progress indicators
+                        progress_bar.empty()
+                        
+                        # Show success message
+                        elapsed_time = time.time() - start_time
+                        st.success(f"✅ Successfully processed {len(processed_df)} tweets in {elapsed_time:.1f} seconds!")
+                        
+                        # Show preview
+                        st.write("### Processed Tweets Preview")
+                        preview_columns = ['text', 'sentiment', 'time_horizon', 'trade_type']
+                        available_cols = [col for col in preview_columns if col in processed_df.columns]
+                        st.dataframe(processed_df[available_cols].head())
+                        
+                    except Exception as e:
+                        st.error(f"Error in processing: {str(e)}")
+                        st.error(traceback.format_exc())
+        else:
+            st.warning("⚠️ No tweets available. Please run tweet extraction first.")
+    
+    with upload_col:
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("<h3 style='color: #1DA1F2; margin-bottom: 15px;'>Upload to Database</h3>", unsafe_allow_html=True)
+        
+        # Check if we have processed data
+        if st.session_state.processed_data is not None:
+            st.markdown("""
+            <div style="background-color: #E8F5E9; padding: 10px; border-radius: 5px; margin-bottom: 15px;">
+                <p style="margin: 0; color: #2E7D32;"><strong>✅ Processed tweets available</strong></p>
+                <p style="margin-top: 5px; color: #2E7D32;">Ready to filter and upload to database</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Upload button with improved styling and feedback
+            if st.button("📤 Filter & Upload", use_container_width=True, type="primary"):
+                try:
+                    # Prepare tweets for filtering
+                    with st.spinner("Preparing tweets for upload..."):
+                        df = st.session_state.processed_data.copy()
+                        
+                        if len(df) == 0:
+                            st.warning("No tweets available for processing.")
+                            return
+                        
+                        # Create progress bar
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        status_text.text("Step 1/4: Preparing data...")
+                        
+                        # Add required columns if they don't exist
+                        required_columns = {
+                            'tweet_id': lambda x: float(x.name),
+                            'author': lambda x: str(x.get('author', ''))[:100],
+                            'text': lambda x: str(x.get('text', '')),
+                            'created_at': lambda x: pd.Timestamp.now(),
+                            'likes': lambda x: float(x.get('likes', 0)),
+                            'retweets': lambda x: float(x.get('retweets', 0)),
+                            'replies_count': lambda x: float(x.get('replies_count', 0)),
+                            'views': lambda x: float(x.get('views', 0)),
+                            'author_followers': lambda x: float(x.get('author_followers', 0)),
+                            'author_following': lambda x: float(x.get('author_following', 0)),
+                            'sentiment': lambda x: x.get('sentiment', 'bullish'),
+                            'trade_type': lambda x: str(x.get('trade_type', 'unknown')),
+                            'time_horizon': lambda x: str(x.get('time_horizon', 'unknown')),
+                            'prediction_date': lambda x: pd.Timestamp.now(),
+                            'tickers_mentioned': lambda x: ','.join([word.strip('$') for word in str(x.get('text', '')).split() if word.startswith('$')]),
+                            'conversation_id': lambda x: float(x.name),
+                            'tweet_type': 'parent',
+                            'reply_to_tweet_id': lambda x: float(0),
+                            'reply_to_user': lambda x: str(x.get('reply_to_user', ''))[:100],
+                            'author_verified': False,
+                            'author_blue_verified': False,
+                            'created_date': lambda x: pd.Timestamp.now().date(),
+                            'has_ticker': True,
+                            'validated_ticker': lambda x: str(x.get('validated_ticker', ''))[:50]
+                        }
+                        
+                        # Update progress
+                        progress_bar.progress(25)
+                        status_text.text("Step 2/4: Filtering actionable tweets...")
+                        
+                        # Add tweet_type column if it doesn't exist
+                        if 'tweet_type' not in df.columns:
+                            df['tweet_type'] = 'parent'  # Default all to parent tweets
+                        
+                        # Add tickers_mentioned if it doesn't exist
+                        if 'tickers_mentioned' not in df.columns:
+                            # Extract tickers from text
+                            df['tickers_mentioned'] = df['text'].apply(
+                                lambda x: ','.join([word.strip('$') for word in str(x).split() if word.startswith('$')])
+                            )
+                        
+                        # Add sentiment if it doesn't exist
+                        if 'sentiment' not in df.columns:
+                            df['sentiment'] = 'unknown'  # Default sentiment
+                        
+                        # Now filter with safety checks
+                        try:
+                            # Filter tweets to only include actionable ones
+                            actionable_tweets = df[
+                                (df['tweet_type'] == 'parent') &
+                                (df['tickers_mentioned'].notna()) & 
+                                (df['tickers_mentioned'] != '') &
+                                (df['sentiment'].isin(['bullish', 'bearish']))
+                            ].copy()
+                        except KeyError as e:
+                            st.error(f"Missing column in data: {str(e)}")
+                            st.info("Adding required columns and continuing...")
+                            
+                            # Add all required columns
+                            for col in ['tweet_type', 'tickers_mentioned', 'sentiment']:
+                                if col not in df.columns:
+                                    if col == 'tweet_type':
+                                        df[col] = 'parent'
+                                    elif col == 'tickers_mentioned':
+                                        df[col] = df['text'].apply(
+                                            lambda x: ','.join([word.strip('$') for word in str(x).split() if word.startswith('$')])
+                                        )
+                                    elif col == 'sentiment':
+                                        df[col] = 'unknown'
+                            
+                            # Try filtering again
+                            actionable_tweets = df[
+                                (df['tweet_type'] == 'parent') &
+                                (df['tickers_mentioned'].notna()) & 
+                                (df['tickers_mentioned'] != '') &
+                                (df['sentiment'].isin(['bullish', 'bearish']))
+                            ].copy()
+                        
+                        if len(actionable_tweets) == 0:
+                            st.warning("No actionable tweets found after filtering.")
+                            return
+                        
+                        # Add missing columns
+                        actionable_tweets = actionable_tweets.assign(
+                            prediction_correct=None,
+                            start_price=None,
+                            end_price=None,
+                            start_date=None,
+                            end_date=None,
+                            company_names=None,
+                            stocks=None,
+                            price_change_pct=None,
+                            actual_return=None,
+                            prediction_score=None
+                        )
+                        
+                        # Update progress
+                        progress_bar.progress(50)
+                        status_text.text("Step 3/4: Preparing data for upload...")
+                        
+                        # Display summary instead of full preview
+                        st.info(f"Found {len(actionable_tweets)} actionable tweets to upload")
+                        
+                        # Show sentiment distribution
+                        sentiment_counts = actionable_tweets['sentiment'].value_counts().to_dict()
+                        sentiment_html = "<div style='margin: 10px 0;'><strong>Sentiment distribution:</strong><br>"
+                        for sentiment, count in sentiment_counts.items():
+                            color = "#4CAF50" if sentiment == "bullish" else "#F44336"
+                            sentiment_html += f"<span style='color:{color};'>{sentiment}</span>: {count} tweets<br>"
+                        sentiment_html += "</div>"
+                        st.markdown(sentiment_html, unsafe_allow_html=True)
+                        
+                        # Update progress
+                        progress_bar.progress(75)
+                        status_text.text("Step 4/4: Uploading to database...")
+                        
+                        # Upload to database
+                        try:
+                            # Capture the output from upload_to_database for debugging
+                            import io
+                            import sys
+                            original_stdout = sys.stdout
+                            debug_output = io.StringIO()
+                            sys.stdout = debug_output
+                            
+                            # Try the upload
+                            success = upload_to_database(actionable_tweets)
+                            
+                            # Restore stdout
+                            sys.stdout = original_stdout
+                            
+                            # Get the debug output
+                            upload_logs = debug_output.getvalue()
+                            
+                            # Update progress
+                            progress_bar.progress(100)
+                            
+                            # Check logs for success message even if function returns False
+                            if success or "Database upload complete" in upload_logs:
+                                # Show success message with animation
+                                st.balloons()
+                                st.success(f"✅ Successfully uploaded {len(actionable_tweets)} tweets to database!")
+                                
+                                # Show details in an expandable section
+                                with st.expander("View Upload Details"):
+                                    st.write(f"Tweet types: {actionable_tweets['tweet_type'].value_counts().to_dict()}")
+                                    st.write(f"Time horizons: {actionable_tweets['time_horizon'].value_counts().to_dict()}")
+                                    st.write(f"Trade types: {actionable_tweets['trade_type'].value_counts().to_dict()}")
+                            else:
+                                st.error("❌ Error during database upload. Check the logs for details.")
+                                with st.expander("View Upload Logs"):
+                                    st.code(upload_logs)
+                        except Exception as e:
+                            st.error(f"Error during upload: {str(e)}")
+                            with st.expander("View Error Details"):
+                                st.code(traceback.format_exc())
+                        
+                except Exception as e:
+                    st.error(f"Error during upload: {str(e)}")
+                    with st.expander("View Error Details"):
+                        st.code(traceback.format_exc())
+        else:
+            st.warning("⚠️ No processed tweets available. Please run LLM processing first.")
+    
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# Function to run the prediction process
+def run_prediction_process(df, output_dir='results'):
+    """Run the full prediction process on the given dataframe"""
+    try:
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Step 1: Filter actionable tweets
+        print("Filtering actionable tweets...")
+        filtered_data = filter_actionable_tweets(df)
+        actionable_tweets = filtered_data['actionable_tweets']
+        analysis_tweets = filtered_data['analysis_tweets']
+        
+        # Save filtered datasets
+        actionable_tweets.to_csv(f'{output_dir}/actionable_tweets.csv', index=False)
+        analysis_tweets.to_csv(f'{output_dir}/analysis_tweets.csv', index=False)
+        
+        # Step 2: Add market validation columns
+        print("Adding market validation...")
+        validated_tweets = add_market_validation_columns(actionable_tweets, all_tweets=df, output_dir=output_dir)
+        validated_tweets.to_csv(f'{output_dir}/validated_tweets.csv', index=False)
+        
+        # Step 3: Analyze user accuracy
+        print("Analyzing user accuracy...")
+        user_accuracy = analyze_user_accuracy(validated_tweets)
+        user_accuracy.to_csv(f'{output_dir}/user_accuracy.csv', index=False)
+        
+        # Step 4: Upload to database
+        print("Uploading to database...")
+        upload_result = upload_to_database(validated_tweets)
+        
+        return {
+            'actionable_tweets': actionable_tweets,
+            'validated_tweets': validated_tweets,
+            'user_accuracy': user_accuracy,
+            'upload_result': upload_result
+        }
+    
+    except Exception as e:
+        print(f"Error in prediction process: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 # Main app
 def main():
-    # Load data
-    df = load_data()
-    
-    if df is None or df.empty:
-        st.error("Failed to load data. Please check the database connection and table structure.")
-        return
-    
-    # Sidebar
+    # Sidebar navigation
     st.sidebar.title("Navigation")
     
     # Add logo or image
     st.sidebar.image("https://www.iconpacks.net/icons/2/free-twitter-logo-icon-2429-thumb.png", width=100)
     
-    # Dashboard selection
-    dashboard = st.sidebar.radio("Select Dashboard", ["Overview", "Trader Profile", "Raw Data Explorer"])
+    page = st.sidebar.radio(
+        "Select a page",
+        ["Dashboard", "Trader Profile", "Raw Data", "Data Extraction"]
+    )
     
-    if dashboard == "Overview":
+    # Load data
+    df = load_data()
+    
+    # Display the selected page
+    if page == "Dashboard":
         create_overview_dashboard(df)
-    elif dashboard == "Trader Profile":
+    elif page == "Trader Profile":
         # Trader selection
         traders = get_traders(df)
         selected_trader = st.sidebar.selectbox("Select Trader", traders)
         
         # Display trader profile
         create_trader_profile(df, selected_trader)
-    else:  # Raw Data Explorer
+    elif page == "Raw Data":
         create_raw_data_dashboard(df)
+    elif page == "Data Extraction":
+        create_data_extraction_dashboard()
     
     # Footer
     st.sidebar.markdown("---")
