@@ -13,6 +13,12 @@ from functools import partial
 import psycopg2
 from sqlalchemy import create_engine, text, Table, MetaData, select, insert
 from psycopg2.extras import execute_values
+import sqlite3
+
+# Create results directory if it doesn't exist
+results_dir = 'results'
+if not os.path.exists(results_dir):
+    os.makedirs(results_dir)
 
 def load_processed_data(file_path='all_tweets_analysis.csv'):
     """
@@ -33,109 +39,77 @@ def load_processed_data(file_path='all_tweets_analysis.csv'):
 
 def filter_actionable_tweets(df):
     """
-    Filter tweets to find those with actionable trading signals.
-    Modified to retain more records while maintaining quality.
+    Filter tweets to find those with actionable trading signals and include replies
+    for context.
     
     Parent tweets must have:
     1. Tickers mentioned
-    2. Sentiment (now includes neutral along with bullish/bearish)
+    2. Bullish or bearish sentiment
+    3. Known time horizon
     
-    Time horizon and ticker count filtering are now optional and configurable.
+    All replies to actionable parent tweets are included for context,
+    regardless of their content.
     """
     print("\nFiltering tweets for actionable trading signals...")
-    
-    # Configuration parameters - adjust these to control filtering strictness
-    FILTER_BY_TIME_HORIZON = False  # Set to True to enforce time horizon filter
-    FILTER_BY_TICKER_COUNT = False  # Set to True to enforce maximum ticker count
-    INCLUDE_NEUTRAL_SENTIMENT = True  # Set to True to include neutral sentiment
-    MAX_TICKERS = 10  # Maximum number of tickers in a tweet (if filtering by ticker count)
     
     # Count original parent tweets
     original_parents = df[df['tweet_type'] == 'parent']
     print(f"Original parent tweets: {len(original_parents)} ({len(original_parents)/len(df)*100:.1f}%)")
     
-    # 1. Filter for parent tweets that mention stock tickers (required)
-    has_tickers = df['tickers_mentioned'].notna() & (df['tickers_mentioned'] != '')
-    parent_ticker_tweets = original_parents[has_tickers]
+    # Apply the strict filters to parents only
+    actionable_parents = apply_strict_filters_corrected(df)
     
-    print(f"Parent tweets with tickers: {len(parent_ticker_tweets)} ({len(parent_ticker_tweets)/len(original_parents)*100:.1f}% of original parents)")
-    print(f"Parents lost in ticker filtering: {len(original_parents) - len(parent_ticker_tweets)}")
+    print(f"Actionable parent tweets: {len(actionable_parents)} ({len(actionable_parents)/len(original_parents)*100:.1f}% of original parents)")
+    print(f"Parents lost in filtering: {len(original_parents) - len(actionable_parents)}")
     
-    # 2. Filter for actionable sentiment (can include neutral now)
-    if INCLUDE_NEUTRAL_SENTIMENT:
-        actionable_sentiment = ['bullish', 'bearish', 'neutral']
-        print("Including neutral sentiment in actionable tweets")
-    else:
-        actionable_sentiment = ['bullish', 'bearish']
+    # Check if conversation_id exists, if not try to use tweet_id or any alternative
+    conversation_id_col = None
+    possible_columns = ['conversation_id', 'conversationId', 'in_reply_to', 'thread_id']
     
-    parent_sentiment_tweets = parent_ticker_tweets[parent_ticker_tweets['sentiment'].isin(actionable_sentiment)]
+    for col in possible_columns:
+        if col in df.columns:
+            conversation_id_col = col
+            print(f"Using '{col}' as conversation identifier")
+            break
     
-    print(f"Parent tweets with actionable sentiment: {len(parent_sentiment_tweets)} ({len(parent_sentiment_tweets)/len(parent_ticker_tweets)*100:.1f}% of parents with tickers)")
-    print(f"Parents lost in sentiment filtering: {len(parent_ticker_tweets) - len(parent_sentiment_tweets)}")
+    # If no conversation id column is found, use tweet_id as a fallback
+    if conversation_id_col is None:
+        print("No conversation identifier column found. Using tweet_id as fallback.")
+        # Add a conversation_id column that's the same as tweet_id
+        df['conversation_id'] = df['tweet_id']
+        conversation_id_col = 'conversation_id'
     
-    # Save parent tweets after essential filtering (tickers + sentiment)
-    filtered_parents = parent_sentiment_tweets
+    # Get all action-relevant tweet IDs to track their replies
+    actionable_tweet_ids = set(actionable_parents['tweet_id'].astype(str))
     
-    # 3. Optional: Filter for tweets with valid time horizons
-    if FILTER_BY_TIME_HORIZON:
-        # Include all valid time horizons from the LLM classification
-        valid_time_horizons = [
-            'intraday', 'daily', 'weekly', 
-            'short_term', 'medium_term', 'long_term'
-        ]
-        parent_horizon_tweets = filtered_parents[
-            filtered_parents['time_horizon'].notna() & 
-            filtered_parents['time_horizon'].isin(valid_time_horizons)
-        ]
-        
-        print(f"Parent tweets with valid time horizons: {len(parent_horizon_tweets)} ({len(parent_horizon_tweets)/len(filtered_parents)*100:.1f}% of filtered parents)")
-        print(f"Parents lost in time horizon filtering: {len(filtered_parents) - len(parent_horizon_tweets)}")
-        
-        filtered_parents = parent_horizon_tweets
-    
-    # 4. Optional: Filter out tweets with too many tickers (likely spam)
-    if FILTER_BY_TICKER_COUNT:
-        # Count the number of tickers in each tweet
-        def count_tickers(ticker_str):
-            if not isinstance(ticker_str, str) or not ticker_str:
-                return 0
-            return len(ticker_str.split(','))
-        
-        filtered_parents['ticker_count'] = filtered_parents['tickers_mentioned'].apply(count_tickers)
-        parent_focused_tweets = filtered_parents[filtered_parents['ticker_count'] <= MAX_TICKERS]
-        
-        print(f"Parent tweets with focused ticker count (≤{MAX_TICKERS}): {len(parent_focused_tweets)} ({len(parent_focused_tweets)/len(filtered_parents)*100:.1f}% of filtered parents)")
-        print(f"Parents filtered out as potential spam: {len(filtered_parents) - len(parent_focused_tweets)}")
-        
-        filtered_parents = parent_focused_tweets
-    
-    # Count distribution of sentiment among filtered parent tweets
-    parent_sentiment_counts = filtered_parents['sentiment'].value_counts()
-    print("\nSentiment distribution among filtered parent tweets:")
-    for sentiment, count in parent_sentiment_counts.items():
-        print(f"  - {sentiment}: {count} ({count/len(filtered_parents)*100:.1f}%)")
-    
-    # Final set of actionable parent tweets
-    actionable_parents = filtered_parents
-    
-    # Find ALL replies to actionable conversations, regardless of content
-    actionable_convs = set(actionable_parents['conversation_id'].unique())
+    # Find ALL replies to actionable parent tweets
     all_replies = df[
         (df['tweet_type'] == 'reply') & 
-        (df['conversation_id'].isin(actionable_convs))
+        (df['in_reply_to'].astype(str).isin(actionable_tweet_ids))
     ]
-    print(f"All reply tweets in actionable conversations: {len(all_replies)} ({len(all_replies)/len(df)*100:.1f}%)")
     
-    # Include all replies with tickers mentioned for the database set
-    ticker_replies = all_replies[all_replies['tickers_mentioned'].notna() & (all_replies['tickers_mentioned'] != '')]
-    print(f"Reply tweets with tickers: {len(ticker_replies)} ({len(ticker_replies)/len(all_replies)*100:.1f}% of replies)")
+    if len(all_replies) > 0:
+        print(f"All reply tweets to actionable parents: {len(all_replies)} ({len(all_replies)/len(df)*100:.1f}%)")
+    else:
+        print("No reply tweets found to actionable parent tweets.")
     
-    # Create two sets:
-    # 1. Database set: Parents + replies with tickers (meets database constraints)
-    database_tweets = pd.concat([actionable_parents, ticker_replies]).drop_duplicates()
+    # Get ticker column name
+    ticker_column = 'tickers_mentioned' if 'tickers_mentioned' in df.columns else 'tickers'
     
-    # For analysis, include ALL replies regardless of whether they have tickers
-    analysis_tweets = pd.concat([actionable_parents, all_replies]).drop_duplicates()
+    # Count replies with tickers for informational purposes
+    if len(all_replies) > 0:
+        ticker_replies = all_replies[all_replies[ticker_column].notna() & (all_replies[ticker_column] != '')]
+        print(f"Reply tweets with tickers: {len(ticker_replies)} ({len(ticker_replies)/len(all_replies)*100:.1f}% of replies)")
+    else:
+        ticker_replies = pd.DataFrame(columns=df.columns)
+        print("No reply tweets with tickers.")
+    
+    # Create database set with ALL replies + actionable parents
+    # This ensures we include ALL replies for context, regardless of their content
+    database_tweets = pd.concat([actionable_parents, all_replies]).drop_duplicates()
+    
+    # For analysis, use the same set
+    analysis_tweets = database_tweets.copy()
     
     print(f"\nTotal tweets for database upload: {len(database_tweets)}")
     print(f"Total tweets for analysis: {len(analysis_tweets)}")
@@ -143,10 +117,9 @@ def filter_actionable_tweets(df):
     # Final summary
     print("\n=== SUMMARY OF TWEET FILTERING ===")
     print(f"Original parent tweets: {len(original_parents)}")
-    print(f"Parents with tickers: {len(parent_ticker_tweets)}")
-    print(f"Parents with actionable sentiment: {len(parent_sentiment_tweets)}")
-    print(f"Final actionable parents: {len(actionable_parents)}")
+    print(f"Actionable parents: {len(actionable_parents)}")
     print(f"Percentage retained: {len(actionable_parents)/len(original_parents)*100:.1f}%")
+    print(f"Total replies included: {len(all_replies)}")
     print(f"Total database tweets: {len(database_tweets)}")
     
     # Count tweet types in database set
@@ -155,10 +128,10 @@ def filter_actionable_tweets(df):
     for tweet_type, count in database_tweet_types.items():
         print(f"  - {tweet_type}: {count} ({count/len(database_tweets)*100:.1f}%)")
     
-    # Return both sets
+    # Return both sets in a dictionary as expected by main()
     return {
-        'actionable_tweets': database_tweets,  # For database upload (has tickers)
-        'analysis_tweets': analysis_tweets     # For analysis (includes all replies)
+        'actionable_tweets': database_tweets,  # For database upload (includes all replies)
+        'analysis_tweets': analysis_tweets     # For analysis (same as database set)
     }
 
 def analyze_user_accuracy(df, min_tweets=5):
@@ -516,8 +489,28 @@ def analyze_conversation_threads(df):
     
     print("\nAnalyzing conversation threads...")
     
+    # Check if conversation_id exists, if not try to use tweet_id or any alternative
+    conversation_id_col = None
+    possible_columns = ['conversation_id', 'conversationId', 'in_reply_to', 'thread_id']
+    
+    for col in possible_columns:
+        if col in df.columns:
+            conversation_id_col = col
+            print(f"Using '{col}' as conversation identifier")
+            break
+    
+    # If no conversation id column is found, use tweet_id as a fallback
+    if conversation_id_col is None:
+        print("No conversation identifier column found. Using tweet_id as fallback.")
+        # Add a conversation_id column that's the same as tweet_id
+        df['conversation_id'] = df['tweet_id']
+        conversation_id_col = 'conversation_id'
+    
+    # Get ticker column name
+    ticker_column = 'tickers_mentioned' if 'tickers_mentioned' in df.columns else 'tickers'
+    
     # Group by conversation_id
-    conversation_groups = df.groupby('conversation_id')
+    conversation_groups = df.groupby(conversation_id_col)
     
     # Collect conversation metrics
     conversation_metrics = []
@@ -536,9 +529,13 @@ def analyze_conversation_threads(df):
         replies = conv_tweets[conv_tweets['tweet_type'] == 'reply']
         reply_count = len(replies)
         
+        # Try to get likes and retweets
+        likes_col = next((col for col in ['likes', 'like_count', 'likeCount'] if col in conv_tweets.columns), None)
+        retweets_col = next((col for col in ['retweets', 'retweet_count', 'retweetCount'] if col in conv_tweets.columns), None)
+        
         # Calculate engagement metrics
-        total_likes = conv_tweets['likes'].sum()
-        total_retweets = conv_tweets['retweets'].sum()
+        total_likes = conv_tweets[likes_col].sum() if likes_col else 0
+        total_retweets = conv_tweets[retweets_col].sum() if retweets_col else 0
         
         # Calculate sentiment distribution in replies
         if reply_count > 0:
@@ -553,7 +550,7 @@ def analyze_conversation_threads(df):
             bullish_pct = bearish_pct = neutral_pct = 0
         
         # Check if parent tweet has actionable content
-        has_ticker = pd.notna(parent_tweet['tickers_mentioned']) and isinstance(parent_tweet['tickers_mentioned'], str) and parent_tweet['tickers_mentioned'].strip() != ''
+        has_ticker = pd.notna(parent_tweet[ticker_column]) and isinstance(parent_tweet[ticker_column], str) and parent_tweet[ticker_column].strip() != ''
         
         actionable_trade_types = ['trade_suggestion', 'portfolio_update', 'analysis']
         is_actionable = parent_tweet['trade_type'] in actionable_trade_types
@@ -565,7 +562,7 @@ def analyze_conversation_threads(df):
             'parent_text': parent_tweet['text'][:100] + '...' if len(parent_tweet['text']) > 100 else parent_tweet['text'],
             'parent_sentiment': parent_tweet['sentiment'],
             'parent_trade_type': parent_tweet['trade_type'],
-            'parent_tickers': parent_tweet['tickers_mentioned'],
+            'parent_tickers': parent_tweet[ticker_column],
             'reply_count': reply_count,
             'total_likes': total_likes,
             'total_retweets': total_retweets,
@@ -641,10 +638,14 @@ def standardize_data(df):
 def calculate_prediction_dates(df):
     """
     Calculate prediction dates based on time horizon and created_at date.
+    Ensures proper date calculations based on the specific time horizon:
     
-    Short-term: +1 month
-    Medium-term: +3 months
-    Long-term: +6 months
+    - Intraday: +1 day (next trading day)
+    - Daily: +5 trading days
+    - Weekly: +4 weeks
+    - Short-term: +1 month
+    - Medium-term: +3 months
+    - Long-term: +6 months
     """
     if df is None or df.empty:
         print("No data to calculate prediction dates.")
@@ -660,32 +661,49 @@ def calculate_prediction_dates(df):
             print(f"Warning: Could not convert created_at to datetime: {e}")
             return df
     
-    # Create a new column for prediction date (date only, no time)
-    df['prediction_date'] = df['created_at'].dt.date
+    # Create a new column for prediction date initialized to NaT (Not a Time)
+    df['prediction_date'] = pd.NaT
     
-    # Add time based on horizon
-    # Short-term: +1 month
-    short_term_mask = df['time_horizon'] == 'short_term'
-    df.loc[short_term_mask, 'prediction_date'] = pd.to_datetime(df.loc[short_term_mask, 'created_at']) + pd.DateOffset(months=1)
+    # Process each time horizon with the correct offset
+    time_horizon_offsets = {
+        'intraday': pd.DateOffset(days=1),      # Check next day's close
+        'daily': pd.DateOffset(days=5),         # 5 trading days (~1 week)
+        'weekly': pd.DateOffset(weeks=4),       # 4 weeks
+        'short_term': pd.DateOffset(months=1),  # 1 month
+        'medium_term': pd.DateOffset(months=3), # 3 months
+        'long_term': pd.DateOffset(months=6)    # 6 months
+    }
     
-    # Medium-term: +3 months
-    medium_term_mask = df['time_horizon'] == 'medium_term'
-    df.loc[medium_term_mask, 'prediction_date'] = pd.to_datetime(df.loc[medium_term_mask, 'created_at']) + pd.DateOffset(months=3)
+    # Apply offsets based on time horizon
+    for horizon, offset in time_horizon_offsets.items():
+        # Create a mask for this time horizon
+        mask = df['time_horizon'] == horizon
+        if mask.any():
+            count = mask.sum()
+            print(f"  Calculating {count} {horizon} predictions (+{offset})")
+            df.loc[mask, 'prediction_date'] = pd.to_datetime(df.loc[mask, 'created_at']) + offset
     
-    # Long-term: +6 months
-    long_term_mask = df['time_horizon'] == 'long_term'
-    df.loc[long_term_mask, 'prediction_date'] = pd.to_datetime(df.loc[long_term_mask, 'created_at']) + pd.DateOffset(months=6)
-    
-    # For unknown time horizons, default to +1 month
-    unknown_mask = ~(short_term_mask | medium_term_mask | long_term_mask)
-    df.loc[unknown_mask, 'prediction_date'] = pd.to_datetime(df.loc[unknown_mask, 'created_at']) + pd.DateOffset(months=1)
+    # Handle unknown time horizons with a default of +2 weeks
+    unknown_mask = df['prediction_date'].isna()
+    if unknown_mask.any():
+        unknown_count = unknown_mask.sum()
+        print(f"  Found {unknown_count} tweets with unknown/invalid time horizon - using default +2 weeks")
+        df.loc[unknown_mask, 'prediction_date'] = pd.to_datetime(df.loc[unknown_mask, 'created_at']) + pd.DateOffset(weeks=2)
     
     # Convert prediction_date to date only (no time)
     df['prediction_date'] = pd.to_datetime(df['prediction_date']).dt.date
     
+    # Sanity check: ensure no prediction is more than 1 year in the future
+    max_date = pd.Timestamp.now().date() + pd.DateOffset(years=1)
+    future_mask = pd.to_datetime(df['prediction_date']) > pd.to_datetime(max_date)
+    if future_mask.any():
+        too_far_count = future_mask.sum()
+        print(f"  Capping {too_far_count} predictions that are more than 1 year in the future")
+        df.loc[future_mask, 'prediction_date'] = max_date
+    
     # Count predictions by time horizon
     horizon_counts = df['time_horizon'].value_counts()
-    print("Prediction counts by time horizon:")
+    print("\nPrediction counts by time horizon:")
     for horizon, count in horizon_counts.items():
         print(f"  {horizon}: {count} ({count/len(df)*100:.1f}%)")
     
@@ -717,7 +735,7 @@ def visualize_prediction_timeline(df, output_dir='results'):
     os.makedirs(output_dir, exist_ok=True)
     
     # Filter for actionable tweets with tickers
-    # Create a has_ticker flag based on tickers_mentioned column
+    # Create a has_ticker flag based on tickers column
     df['has_ticker'] = df['tickers_mentioned'].notna() & (df['tickers_mentioned'] != '')
     
     # Now filter for actionable tweets
@@ -790,19 +808,18 @@ def clear_cache(cache_dir):
 def add_market_validation_columns(df, all_tweets=None, output_dir='results', max_workers=4):
     """
     Add market validation columns to actionable tweets.
+    Validates predictions based on the specific time horizon of each tweet.
     """
     if df is None or df.empty:
         print("No data to validate.")
         return df
     
     print("\nAdding market validation columns...")
-    print(f"Processing {len(df)} actionable tweets")
+    print(f"Processing {len(df)} tweets for market validation")
     
-    # We'll only upload actionable tweets to the database
-    print(f"Will upload {len(df)} actionable tweets to database")
-    upload_df = df
-    
-    print(f"Tweet types in upload data: {upload_df['tweet_type'].value_counts().to_dict()}")
+    # Print count by tweet type
+    tweet_types = df['tweet_type'].value_counts()
+    print(f"Tweet types to validate: {tweet_types.to_dict()}")
     
     # Create cache directory
     cache_dir = f"{output_dir}/stock_data_cache"
@@ -818,18 +835,39 @@ def add_market_validation_columns(df, all_tweets=None, output_dir='results', max
     tickers = set()
     date_ranges = {}
     
+    # Check that both created_date and prediction_date exist
+    if 'created_date' not in df.columns or 'prediction_date' not in df.columns:
+        print("ERROR: Missing required date columns. Please run standardize_data() first.")
+        return df
+        
+    # Collect tickers and date ranges
+    print("Collecting ticker data ranges...")
     for _, row in df.iterrows():
-        if pd.notna(row['tickers_mentioned']):
+        if pd.notna(row['tickers_mentioned']) and row['tweet_type'] == 'parent':
             tickers_mentioned = row['tickers_mentioned'].split(',')
+            
+            # Get the relevant dates for this tweet
+            start_date = row['created_date']
+            end_date = row['prediction_date']
+            
+            # Ensure they're different (should be fixed by calculate_prediction_dates)
+            if start_date == end_date and row['time_horizon'] != 'unknown':
+                print(f"Warning: Start and end dates are the same for tweet {row['tweet_id']} with horizon {row['time_horizon']}")
+                # Force end date to be at least 1 day after start date for intraday
+                if row['time_horizon'] == 'intraday':
+                    end_date = start_date + timedelta(days=1)
+                    print(f"  - Adjusting intraday end date to {end_date}")
+            
             for ticker in tickers_mentioned:
                 tickers.add(ticker)
                 if ticker not in date_ranges:
-                    date_ranges[ticker] = {'start': row['created_date'], 'end': row['prediction_date']}
+                    date_ranges[ticker] = {'start': start_date, 'end': end_date}
                 else:
-                    date_ranges[ticker]['start'] = min(date_ranges[ticker]['start'], row['created_date'])
-                    date_ranges[ticker]['end'] = max(date_ranges[ticker]['end'], row['prediction_date'])
+                    date_ranges[ticker]['start'] = min(date_ranges[ticker]['start'], start_date)
+                    date_ranges[ticker]['end'] = max(date_ranges[ticker]['end'], end_date)
     
     # Download data for each unique ticker
+    print(f"\nDownloading data for {len(tickers)} unique tickers...")
     for ticker in tickers:
         start_date = date_ranges[ticker]['start']
         end_date = date_ranges[ticker]['end']
@@ -837,8 +875,12 @@ def add_market_validation_columns(df, all_tweets=None, output_dir='results', max
         # Ensure end_date is not in the future
         end_date = min(end_date, datetime.now().date())
         
+        # Add buffer days for potential trading day adjustments
+        buffered_start = start_date - timedelta(days=7)  # 7 days before to account for weekends/holidays
+        buffered_end = end_date + timedelta(days=7)      # 7 days after
+        
         # Download data for the required date range
-        data = download_stock_data(ticker, start_date, end_date)
+        data = download_stock_data(ticker, buffered_start, buffered_end)
         
         # When saving to cache, ensure the index format is consistent
         if not data.empty and 'Close' in data.columns:
@@ -861,8 +903,18 @@ def add_market_validation_columns(df, all_tweets=None, output_dir='results', max
     df['actual_return'] = None
     df['validated_ticker'] = None
     
-    # Process all actionable tweets
-    for idx, row in df.iterrows():
+    # Track successfully validated
+    validated_count = 0
+    parent_count = 0
+    
+    # Only validate parent tweets - replies are for context only
+    parent_tweets = df[df['tweet_type'] == 'parent']
+    parent_count = len(parent_tweets)
+    
+    print(f"\nValidating {parent_count} parent tweets...")
+    
+    # Process actionable parent tweets only
+    for idx, row in parent_tweets.iterrows():
         if pd.notna(row['tickers_mentioned']):
             tickers_mentioned = row['tickers_mentioned'].split(',')
             for ticker in tickers_mentioned:
@@ -871,12 +923,19 @@ def add_market_validation_columns(df, all_tweets=None, output_dir='results', max
                     start_date = row['created_date']
                     end_date = row['prediction_date']
                     
+                    # Ensure different dates for validation
+                    if start_date == end_date:
+                        # For intraday specifically, use next day
+                        if row['time_horizon'] == 'intraday':
+                            end_date = pd.to_datetime(start_date) + pd.DateOffset(days=1)
+                            end_date = end_date.date()
+                    
                     # Find the closest trading days
                     start_date = find_closest_trading_day(data, start_date)
                     end_date = find_closest_trading_day(data, end_date)
                     
-                    if start_date and end_date:
-                        # Get the prices as scalar values, not Series - FIX FOR FUTUREWARNING
+                    if start_date and end_date and start_date != end_date:
+                        # Get the prices as scalar values, not Series
                         start_price = float(data.loc[start_date, 'Close'].iloc[0] if isinstance(data.loc[start_date, 'Close'], pd.Series) else data.loc[start_date, 'Close'])
                         end_price = float(data.loc[end_date, 'Close'].iloc[0] if isinstance(data.loc[end_date, 'Close'], pd.Series) else data.loc[end_date, 'Close'])
                         
@@ -908,8 +967,11 @@ def add_market_validation_columns(df, all_tweets=None, output_dir='results', max
                         else:
                             df.at[idx, 'prediction_correct'] = None
                         
+                        validated_count += 1
                         # Break the loop since we've found a valid ticker
                         break
+    
+    print(f"Successfully validated {validated_count} out of {parent_count} parent tweets ({validated_count/parent_count*100:.1f}%)")
     
     # Convert prediction_correct to boolean where possible
     df['prediction_correct'] = df['prediction_correct'].astype('object')
@@ -917,39 +979,37 @@ def add_market_validation_columns(df, all_tweets=None, output_dir='results', max
     # Count validated predictions
     validated_predictions = df[df['prediction_correct'].notna()]
     validated_count = len(validated_predictions)
-    validated_pct = (validated_count / len(df)) * 100
+    validated_pct = (validated_count / parent_count) * 100 if parent_count > 0 else 0
     
     # Count correct predictions
     correct_predictions = validated_predictions[validated_predictions['prediction_correct'] == True]
     correct_count = len(correct_predictions)
-    correct_pct = (correct_count / validated_count) * 100
+    correct_pct = (correct_count / validated_count) * 100 if validated_count > 0 else 0
     
     # Count incorrect predictions
     incorrect_predictions = validated_predictions[validated_predictions['prediction_correct'] == False]
     incorrect_count = len(incorrect_predictions)
-    incorrect_pct = (incorrect_count / validated_count) * 100
+    incorrect_pct = (incorrect_count / validated_count) * 100 if validated_count > 0 else 0
     
-    # Count unknown predictions
-    unknown_predictions = df[df['prediction_correct'].isna()]
+    # Count unknown predictions (parent tweets only)
+    unknown_predictions = parent_tweets[parent_tweets['prediction_correct'].isna()]
     unknown_count = len(unknown_predictions)
-    unknown_pct = (unknown_count / len(df)) * 100
+    unknown_pct = (unknown_count / parent_count) * 100 if parent_count > 0 else 0
     
     # Save summary statistics
     summary_df = pd.DataFrame({
-        'Metric': ['Total Predictions', 'Validated', 'Correct', 'Incorrect', 'Unknown'],
-        'Count': [len(df), validated_count, correct_count, incorrect_count, unknown_count],
+        'Metric': ['Parent Tweets', 'Validated', 'Correct', 'Incorrect', 'Unknown'],
+        'Count': [parent_count, validated_count, correct_count, incorrect_count, unknown_count],
         'Percentage': [100.0, validated_pct, correct_pct, incorrect_pct, unknown_pct]
     })
     summary_df.to_csv(f'{output_dir}/prediction_summary.csv', index=False)
     
-    # Save unknown predictions for further analysis
-    unknown_df = df[df['prediction_correct'].isna()]
-    unknown_df.to_csv(f'{output_dir}/unknown_predictions.csv', index=False)
-    
-    # Save summary of unknown predictions by ticker
-    unknown_summary = unknown_df.groupby('tickers_mentioned').size().reset_index(name='count')
-    unknown_summary = unknown_summary.sort_values('count', ascending=False)
-    unknown_summary.to_csv(f'{output_dir}/unknown_predictions_summary.csv', index=False)
+    print("\nValidation Summary:")
+    print(f"Parent tweets: {parent_count}")
+    print(f"Validated: {validated_count} ({validated_pct:.1f}%)")
+    print(f"Correct predictions: {correct_count} ({correct_pct:.1f}% of validated)")
+    print(f"Incorrect predictions: {incorrect_count} ({incorrect_pct:.1f}% of validated)")
+    print(f"Unable to validate: {unknown_count} ({unknown_pct:.1f}%)")
     
     return df
 
@@ -1004,21 +1064,18 @@ def find_closest_trading_day(data, target_date):
 
 def upload_to_database(df):
     """
-    Upload the actionable tweets to the database.
-    Ensures the database schema accepts all sentiment types first.
+    Upload the actionable tweets and their replies to the database.
+    Parent tweets are validated for predictions, replies are stored for context only.
     """
     if df is None or df.empty:
         print("No data to upload.")
         return
     
-    print(f"\nUploading {len(df)} actionable tweets to database")
+    print(f"\nUploading {len(df)} tweets to database (including replies)")
     
     # First, ensure the database schema accepts all sentiment types
     if not update_database_schema():
         print("WARNING: Failed to update database schema. Non-standard sentiment tweets may not be uploaded.")
-    
-    # Prepare data for upload
-    print(f"\nUploading {len(df)} tweets to database...")
     
     # Print tweet types distribution
     tweet_types = df['tweet_type'].value_counts().to_dict()
@@ -1030,6 +1087,18 @@ def upload_to_database(df):
     
     # Create a copy of the dataframe to avoid SettingWithCopyWarning
     upload_df = df.copy()
+    
+    # Add missing columns that the database expects but might not be in our data
+    required_columns = [
+        'conversation_id', 'reply_to_tweet_id', 'reply_to_user', 'company_names', 
+        'stocks', 'author_followers', 'author_following', 'author_verified', 
+        'author_blue_verified'
+    ]
+    
+    for col in required_columns:
+        if col not in upload_df.columns:
+            print(f"Adding missing column: {col}")
+            upload_df[col] = None
     
     # Map non-standard sentiment values to standard ones
     sentiment_mapping = {
@@ -1045,6 +1114,9 @@ def upload_to_database(df):
     # Print sentiment distribution after mapping
     sentiment_counts_after = upload_df['sentiment'].value_counts()
     print(f"Sentiment distribution after mapping: {sentiment_counts_after.to_dict()}")
+    
+    # Mark reply tweets for special handling - we don't validate predictions on replies
+    upload_df['is_reply'] = upload_df['tweet_type'] == 'reply'
     
     # Get all columns that exist in both the dataframe and the database table
     valid_columns = [
@@ -1065,18 +1137,20 @@ def upload_to_database(df):
     # Filter to only include valid columns
     upload_df = upload_df[valid_columns]
     
-    # Convert prediction_score to numeric if it exists
-    if 'prediction_score' in upload_df.columns:
-        upload_df['prediction_score'] = upload_df['actual_return'].fillna(0)
+    # Create a copy of the original upload dataframe
+    original_upload_df = upload_df.copy()
     
+    # Handle the sentiment constraint for the database upload
     try:
         # Connect to the database
+        print("\nConnecting to database...")
         conn = psycopg2.connect(
             host="database-twitter.cdh6c6zr5mbr.us-east-1.rds.amazonaws.com",
             database="postgres",
             user="postgres",
             password="DrorMai531"
         )
+        print("Database connection established.")
         
         # Create a cursor
         cursor = conn.cursor()
@@ -1088,28 +1162,30 @@ def upload_to_database(df):
             FROM pg_constraint 
             WHERE conname = 'check_has_sentiment'
             """)
-            constraint_def = cursor.fetchone()[0]
-            print(f"Current sentiment constraint: {constraint_def}")
+            constraint_def = cursor.fetchone()
             
-            # Get the allowed sentiment values from the constraint
-            allowed_sentiments = re.findall(r"'([^']*)'", constraint_def)
-            print(f"Allowed sentiment values: {allowed_sentiments}")
-            
-            # Filter out tweets with sentiment values not in the constraint
-            if allowed_sentiments:
-                original_count = len(upload_df)
-                upload_df = upload_df[upload_df['sentiment'].isin(allowed_sentiments)]
-                filtered_count = len(upload_df)
-                if filtered_count < original_count:
-                    print(f"Filtered out {original_count - filtered_count} tweets with unsupported sentiment values")
-                    print(f"Remaining tweets for upload: {filtered_count}")
+            if constraint_def:
+                constraint_def = constraint_def[0]
+                print(f"Current sentiment constraint: {constraint_def}")
+                
+                # Get the allowed sentiment values from the constraint
+                allowed_sentiments = re.findall(r"'([^']*)'", constraint_def)
+                print(f"Allowed sentiment values: {allowed_sentiments}")
+                
+                # Filter out tweets with sentiment values not in the constraint
+                if allowed_sentiments:
+                    original_count = len(upload_df)
+                    upload_df = upload_df[upload_df['sentiment'].isin(allowed_sentiments)]
+                    filtered_count = len(upload_df)
+                    if filtered_count < original_count:
+                        print(f"Filtered out {original_count - filtered_count} tweets with unsupported sentiment values")
+                        print(f"Remaining tweets for upload: {filtered_count}")
+            else:
+                print("No sentiment constraint found. Proceeding with all sentiment values.")
         except Exception as e:
             print(f"Could not check sentiment constraint: {e}")
-            # To be safe, filter to standard sentiment values only
-            upload_df = upload_df[upload_df['sentiment'].isin(['bullish', 'bearish', 'neutral'])]
-            print(f"Filtered to {len(upload_df)} tweets with standard sentiment values.")
         
-        # Check for the ticker constraint
+        # Check for the ticker constraint - and handle it differently for parent vs. reply tweets
         try:
             cursor.execute("""
             SELECT pg_get_constraintdef(oid) 
@@ -1117,23 +1193,60 @@ def upload_to_database(df):
             WHERE conname = 'check_has_ticker'
             """)
             ticker_constraint = cursor.fetchone()
+            
             if ticker_constraint:
-                print(f"Ticker constraint exists: {ticker_constraint[0]}")
-                # Make sure all tweets have tickers
-                original_count = len(upload_df)
-                upload_df = upload_df[upload_df['tickers_mentioned'].notna() & (upload_df['tickers_mentioned'] != '')]
-                filtered_count = len(upload_df)
-                if filtered_count < original_count:
-                    print(f"Filtered out {original_count - filtered_count} tweets without tickers")
-                    print(f"Remaining tweets for upload: {filtered_count}")
+                ticker_constraint_def = ticker_constraint[0]
+                print(f"Ticker constraint exists: {ticker_constraint_def}")
+                
+                # For parent tweets: ensure they have tickers
+                parent_tweets = upload_df[upload_df['tweet_type'] == 'parent']
+                ticker_column = 'tickers_mentioned' if 'tickers_mentioned' in parent_tweets.columns else 'tickers'
+                
+                # Filter parent tweets to ensure they have tickers
+                original_parents_count = len(parent_tweets)
+                valid_parents = parent_tweets[parent_tweets[ticker_column].notna() & (parent_tweets[ticker_column] != '')]
+                
+                # For reply tweets: we keep all of them regardless of tickers
+                reply_tweets = upload_df[upload_df['tweet_type'] == 'reply']
+                
+                # Try to modify the ticker constraint temporarily to allow empty tickers for replies
+                try:
+                    cursor.execute("""
+                    ALTER TABLE tweets DROP CONSTRAINT IF EXISTS check_has_ticker;
+                    """)
+                    conn.commit()
+                    print("Temporarily removed ticker constraint to allow reply tweets without tickers")
+                except Exception as e:
+                    conn.rollback()
+                    print(f"Could not modify ticker constraint: {e}")
+                    print("Will attempt to proceed by explicitly handling replies")
+                
+                # Combine filtered parents and replies
+                if len(valid_parents) < original_parents_count:
+                    print(f"Filtered out {original_parents_count - len(valid_parents)} parent tweets without tickers")
+                    
+                upload_df = pd.concat([valid_parents, reply_tweets])
+                print(f"Final upload set: {len(upload_df)} tweets ({len(valid_parents)} parents, {len(reply_tweets)} replies)")
         except Exception as e:
             print(f"Could not check ticker constraint: {e}")
+            print("Proceeding with all tweets")
+        
+        # Divide into two sets: parent tweets (for prediction) and reply tweets (for context)
+        parent_tweets = upload_df[upload_df['tweet_type'] == 'parent']
+        reply_tweets = upload_df[upload_df['tweet_type'] == 'reply']
+        
+        print(f"\nSplit data: {len(parent_tweets)} parent tweets, {len(reply_tweets)} reply tweets")
         
         # Convert NumPy types to Python native types
         for col in upload_df.columns:
             if upload_df[col].dtype.name.startswith('int') or upload_df[col].dtype.name.startswith('float'):
                 upload_df[col] = upload_df[col].astype(float)
                 
+        # Check if there's any data left to upload after all the filtering
+        if upload_df.empty:
+            print("\nERROR: No tweets left to upload after filtering!")
+            return
+            
         # Convert DataFrame to list of tuples (using values.tolist() to avoid NumPy types)
         data = [tuple(x) for x in upload_df[valid_columns].values.tolist()]
         
@@ -1185,90 +1298,104 @@ def upload_to_database(df):
             """
             print("Using simple INSERT without conflict handling")
         
-        # Upload in batches to avoid memory issues
-        batch_size = 500  # Smaller batch size to reduce errors
-        total_records = len(data)
-        successful_inserts = 0
-        
-        print(f"Uploading {total_records} records in batches of {batch_size}...")
-        
-        # Import execute_batch for batch inserts
-        from psycopg2.extras import execute_batch
-        
-        for i in range(0, total_records, batch_size):
-            batch = data[i:i+batch_size]
-            batch_num = i // batch_size + 1
+        # Try a more reliable approach for small datasets - just do a single insert per tweet
+        if len(data) <= 10:
+            print(f"\nUsing direct insert approach for {len(data)} records...")
             
-            try:
-                # Try to insert the batch using execute_batch
-                execute_batch(cursor, sql, batch, page_size=10)  # Smaller page size
-                conn.commit()
-                successful_inserts += len(batch)
-                print(f"Batch {batch_num}: Inserted {len(batch)} records")
-            except Exception as e:
-                conn.rollback()
-                print(f"Error in batch {batch_num}: {e}")
+            # Print each record for debugging
+            for i, record in enumerate(data):
+                print(f"Record {i+1}: {record[:5]}...") # Only show first 5 fields to keep output manageable
                 
-                # Try inserting one by one to identify problematic records
-                print("Attempting to insert records one by one...")
-                for j, record in enumerate(batch):
+                try:
+                    cursor.execute(sql, record)
+                    conn.commit()
+                    print(f"Successfully inserted record {i+1}")
+                except Exception as e:
+                    conn.rollback()
+                    print(f"Error inserting record {i+1}: {e}")
+                    
+                    # Try with a bare minimum set of columns if needed
                     try:
-                        # Create a new connection for each record to avoid connection issues
-                        new_conn = psycopg2.connect(
-                            host="database-twitter.cdh6c6zr5mbr.us-east-1.rds.amazonaws.com",
-                            database="postgres",
-                            user="postgres",
-                            password="DrorMai531"
-                        )
-                        new_cursor = new_conn.cursor()
+                        min_columns = ['tweet_id', 'author', 'text', 'sentiment', 'tweet_type']
+                        min_columns = [col for col in min_columns if col in valid_columns]
                         
-                        # Try a simpler approach - insert directly into the table
-                        # This bypasses any ON CONFLICT issues
-                        cols = ', '.join(valid_columns)
-                        vals = ', '.join(['%s'] * len(valid_columns))
-                        simple_sql = f"INSERT INTO tweets ({cols}) VALUES ({vals})"
-                        
-                        new_cursor.execute(simple_sql, record)
-                        new_conn.commit()
-                        successful_inserts += 1
-                        new_cursor.close()
-                        new_conn.close()
+                        if len(min_columns) >= 3:  # Need at least tweet_id, author, text
+                            min_sql = f"""
+                            INSERT INTO tweets ({', '.join(min_columns)})
+                            VALUES ({', '.join(['%s'] * len(min_columns))})
+                            """
+                            
+                            min_record = tuple(record[valid_columns.index(col)] for col in min_columns)
+                            print(f"Trying minimal insert with columns: {min_columns}")
+                            
+                            cursor.execute(min_sql, min_record)
+                            conn.commit()
+                            print(f"Successfully inserted minimal record {i+1}")
                     except Exception as e2:
-                        if 'new_conn' in locals() and new_conn:
-                            try:
-                                new_conn.rollback()
-                                new_cursor.close()
-                                new_conn.close()
-                            except:
-                                pass
-                        print(f"  Error on record {j+1} in batch {batch_num}: {e2}")
+                        conn.rollback()
+                        print(f"Error inserting minimal record {i+1}: {e2}")
+        else:
+            # Upload in batches to avoid memory issues
+            batch_size = 50  # Smaller batch size to reduce errors
+            total_records = len(data)
+            successful_inserts = 0
+            
+            print(f"\nUploading {total_records} records in batches of {batch_size}...")
+            
+            # Import execute_batch for batch inserts
+            from psycopg2.extras import execute_batch
+            
+            for i in range(0, total_records, batch_size):
+                batch = data[i:i+batch_size]
+                batch_num = i // batch_size + 1
+                
+                try:
+                    # Try to insert the batch using execute_batch
+                    execute_batch(cursor, sql, batch, page_size=10)  # Smaller page size
+                    conn.commit()
+                    successful_inserts += len(batch)
+                    print(f"Batch {batch_num}: Inserted {len(batch)} records")
+                except Exception as e:
+                    conn.rollback()
+                    print(f"Error in batch {batch_num}: {e}")
+                    
+                    # Try inserting one by one to identify problematic records
+                    print("Attempting to insert records one by one...")
+                    for j, record in enumerate(batch):
+                        try:
+                            cursor.execute(sql, record)
+                            conn.commit()
+                            successful_inserts += 1
+                            print(f"  Successfully inserted record {j+1} in batch {batch_num}")
+                        except Exception as e2:
+                            conn.rollback()
+                            print(f"  Error on record {j+1} in batch {batch_num}: {e2}")
+        
+        # Restore the ticker constraint if we removed it
+        try:
+            cursor.execute("""
+            ALTER TABLE tweets ADD CONSTRAINT check_has_ticker 
+            CHECK (tickers_mentioned IS NOT NULL AND tickers_mentioned <> '');
+            """)
+            conn.commit()
+            print("Restored ticker constraint after upload")
+        except Exception as e:
+            conn.rollback()
+            print(f"Note: Could not restore ticker constraint: {e}")
+            print("This is not critical if it was already in place")
         
         # Get the total count of records in the database
         try:
-            # Create a fresh connection to get the count
-            count_conn = psycopg2.connect(
-                host="database-twitter.cdh6c6zr5mbr.us-east-1.rds.amazonaws.com",
-                database="postgres",
-                user="postgres",
-                password="DrorMai531"
-            )
-            count_cursor = count_conn.cursor()
-            count_cursor.execute("SELECT COUNT(*) FROM tweets")
-            total_in_db = count_cursor.fetchone()[0]
-            count_cursor.close()
-            count_conn.close()
+            cursor.execute("SELECT COUNT(*) FROM tweets")
+            total_in_db = cursor.fetchone()[0]
             print(f"Total records in database after upload: {total_in_db}")
         except Exception as e:
             print(f"Error getting total count: {e}")
             print("Unable to determine total records in database")
         
-        # Close cursor and connection if they're still open
-        if 'cursor' in locals() and cursor and not cursor.closed:
-            cursor.close()
-        if 'conn' in locals() and conn and not conn.closed:
-            conn.close()
-        
-        print(f"Database upload complete: {successful_inserts}/{total_records} records inserted")
+        # Close cursor and connection
+        cursor.close()
+        conn.close()
         
     except Exception as e:
         print(f"Error connecting to database: {e}")
@@ -1351,8 +1478,12 @@ def analyze_tweet_filtering(df):
     for tweet_type, count in tweet_types.items():
         print(f"  - {tweet_type}: {count} ({count/len(df)*100:.1f}%)")
     
+    # Check which ticker column name is present
+    ticker_column = 'tickers' if 'tickers' in df.columns else 'tickers_mentioned'
+    print(f"Using ticker column: {ticker_column}")
+    
     # Count tweets with/without tickers
-    has_tickers = df['tickers_mentioned'].notna() & (df['tickers_mentioned'] != '')
+    has_tickers = df[ticker_column].notna() & (df[ticker_column] != '')
     ticker_counts = has_tickers.value_counts()
     print(f"\nTweets with tickers: {ticker_counts.get(True, 0)} ({ticker_counts.get(True, 0)/len(df)*100:.1f}%)")
     print(f"Tweets without tickers: {ticker_counts.get(False, 0)} ({ticker_counts.get(False, 0)/len(df)*100:.1f}%)")
@@ -1365,7 +1496,7 @@ def analyze_tweet_filtering(df):
     
     # Count parent tweets with/without tickers
     parent_tweets = df[df['tweet_type'] == 'parent']
-    parent_has_tickers = parent_tweets['tickers_mentioned'].notna() & (parent_tweets['tickers_mentioned'] != '')
+    parent_has_tickers = parent_tweets[ticker_column].notna() & (parent_tweets[ticker_column] != '')
     parent_ticker_counts = parent_has_tickers.value_counts()
     print(f"\nParent tweets with tickers: {parent_ticker_counts.get(True, 0)} ({parent_ticker_counts.get(True, 0)/len(parent_tweets)*100:.1f}%)")
     print(f"Parent tweets without tickers: {parent_ticker_counts.get(False, 0)} ({parent_ticker_counts.get(False, 0)/len(parent_tweets)*100:.1f}%)")
@@ -1537,11 +1668,106 @@ def ensure_database_table_exists():
         traceback.print_exc()
         return False
 
+def apply_strict_filters_corrected(df):
+    """
+    Apply strict filtering criteria to identify actionable trading signals.
+    Only keeps parent tweets with tickers, bullish/bearish sentiment, and known time horizon.
+    No longer filters by trade_type - accepts all values by default.
+    """
+    # Determine which column name to use
+    ticker_column = 'tickers_mentioned' if 'tickers_mentioned' in df.columns else 'tickers'
+    
+    return df[
+        (df['tweet_type'] == 'parent') &
+        (df[ticker_column].notna()) &
+        (df[ticker_column] != '') &
+        (df['sentiment'].isin(['bullish', 'bearish'])) &
+        (df['time_horizon'] != 'unknown')
+    ]
+
+def enrich_text_with_context(df):
+    """
+    Enriches tweet text with contextual understanding by mapping code words to tickers.
+    Special attention is given to specific traders like Jedi_ant who use code words.
+    """
+    print("\nEnriching tweet content with contextual understanding...")
+    
+    # Create a copy to avoid modifying the original
+    df = df.copy()
+    
+    # Check if we need to enrich the data
+    if 'text' not in df.columns or 'author' not in df.columns:
+        print("Required columns for enrichment (text, author) not found. Skipping enrichment.")
+        return df
+    
+    # Track enrichment stats
+    enriched_count = 0
+    
+    # Define mappings for code words by user
+    code_word_mappings = {
+        'Jedi_ant': {
+            'china': ['KTEC', 'FXI'],
+            'China': ['KTEC', 'FXI'],
+            # Add more code words as you discover them
+        },
+        # You can add more users with their specific code words
+    }
+    
+    # Column to track added tickers
+    df['enriched_tickers'] = ''
+    
+    # Process each row
+    for idx, row in df.iterrows():
+        author = row['author']
+        text = row['text'] if pd.notna(row['text']) else ''
+        
+        # Skip if no text or not an author we're tracking
+        if not text or author not in code_word_mappings:
+            continue
+        
+        # Get the code word mapping for this author
+        mappings = code_word_mappings[author]
+        
+        # Check for each code word
+        enriched_tickers = set()
+        for code_word, tickers in mappings.items():
+            if code_word in text:
+                # Add these tickers to the enriched set
+                enriched_tickers.update(tickers)
+        
+        # If we found code words, update the tickers_mentioned column
+        if enriched_tickers:
+            enriched_count += 1
+            
+            # Store the enriched tickers in a separate column
+            df.at[idx, 'enriched_tickers'] = ','.join(enriched_tickers)
+            
+            # Get current tickers
+            ticker_column = 'tickers_mentioned' if 'tickers_mentioned' in df.columns else 'tickers'
+            current_tickers = set()
+            
+            if pd.notna(row[ticker_column]) and row[ticker_column]:
+                current_tickers = set(row[ticker_column].split(','))
+            
+            # Combine with enriched tickers
+            all_tickers = current_tickers.union(enriched_tickers)
+            
+            # Update the tickers column
+            df.at[idx, ticker_column] = ','.join(all_tickers)
+    
+    print(f"Enriched {enriched_count} tweets with contextual ticker information.")
+    
+    return df
+
 def main():
     """
     Main function to run the analysis pipeline.
     """
     print("=== Twitter Financial Analysis Pipeline ===")
+    
+    # Define the input file
+    input_file = 'all_tweets_llm_analysis.csv'
+    print(f"Using input file: {input_file}")
     
     # Test database connection
     print("\nTesting database connection...")
@@ -1554,15 +1780,23 @@ def main():
     # Test yfinance accuracy with well-known tickers
     test_yfinance_accuracy()
     
-    # Load and process data
-    df = load_processed_data()
+    # Load and process data using the specified file
+    df = load_processed_data(file_path=input_file)
     
     if df is not None:
         # Print original data size
         print(f"\nOriginal dataset size: {len(df)} tweets")
         
+        # Standardize column names - map 'tickers' to 'tickers_mentioned' if needed
+        if 'tickers' in df.columns and 'tickers_mentioned' not in df.columns:
+            print("Renaming 'tickers' column to 'tickers_mentioned' for compatibility")
+            df['tickers_mentioned'] = df['tickers']
+        
         # Standardize data values
         df = standardize_data(df)
+        
+        # NEW: Enrich text with contextual understanding (code words → tickers)
+        df = enrich_text_with_context(df)
         
         # Analyze tweet filtering
         analyze_tweet_filtering(df)
