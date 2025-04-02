@@ -496,12 +496,15 @@ def compute_profile_summary(df_user, df_parent):
     })
     
     prediction_stats = df_parent['prediction_correct'].value_counts()
+    total_validated = prediction_stats.sum()
+    
     profile_summary.update({
         "Total Predictions": len(df_parent),
         "Successful Predictions": prediction_stats.get(True, 0),
         "Failed Predictions": prediction_stats.get(False, 0),
-        "Pending Predictions": len(df_parent) - prediction_stats.sum(),
-        "Prediction Accuracy (%)": (prediction_stats.get(True, 0) / prediction_stats.sum() * 100) if prediction_stats.sum() > 0 else 0
+        "Pending Predictions": len(df_parent) - total_validated,
+        "Prediction Accuracy (%)": (prediction_stats.get(True, 0) / total_validated * 100) if total_validated > 0 else 0,
+        "Validated Predictions": f"{total_validated}/{len(df_parent)} ({(total_validated/len(df_parent)*100):.1f}%)"
     })
     
     profile_summary.update({
@@ -525,12 +528,23 @@ def compute_profile_summary(df_user, df_parent):
     bullish_tweets = df_parent[df_parent['sentiment'] == 'bullish']
     bearish_tweets = df_parent[df_parent['sentiment'] == 'bearish']
     
-    bullish_accuracy = (bullish_tweets['prediction_correct'].mean() * 100) if not bullish_tweets.empty else 0
-    bearish_accuracy = (bearish_tweets['prediction_correct'].mean() * 100) if not bearish_tweets.empty else 0
+    # Only consider validated predictions (where prediction_correct is not NaN)
+    validated_bullish = bullish_tweets[bullish_tweets['prediction_correct'].notna()]
+    validated_bearish = bearish_tweets[bearish_tweets['prediction_correct'].notna()]
+    
+    # Calculate accuracy only if we have enough validated predictions
+    bullish_accuracy = (validated_bullish['prediction_correct'].mean() * 100) if len(validated_bullish) >= 3 else 0
+    bearish_accuracy = (validated_bearish['prediction_correct'].mean() * 100) if len(validated_bearish) >= 3 else 0
+    
+    # Add counts to make interpretation easier
+    bullish_info = f"{bullish_accuracy:.1f}% ({len(validated_bullish)}/{len(bullish_tweets)} validated)"
+    bearish_info = f"{bearish_accuracy:.1f}% ({len(validated_bearish)}/{len(bearish_tweets)} validated)"
     
     profile_summary.update({
         "Bullish Accuracy (%)": bullish_accuracy,
-        "Bearish Accuracy (%)": bearish_accuracy
+        "Bearish Accuracy (%)": bearish_accuracy,
+        "Bullish Accuracy Info": bullish_info,
+        "Bearish Accuracy Info": bearish_info
     })
     
     if 'start_date' in df_parent.columns and 'end_date' in df_parent.columns:
@@ -542,6 +556,73 @@ def compute_profile_summary(df_user, df_parent):
         profile_summary["Sentiment Consistency (%)"] = consistency_by_conv.mean() * 100
     
     return profile_summary
+
+def format_and_display_data(df, title="Show Raw Data", relevant_columns=None):
+    """Helper function to format and display a dataframe in an expander."""
+    if df is None or df.empty:
+        st.warning("No data available to display.")
+        return
+
+    display_df = df.copy()
+
+    # Define default core columns if specific ones aren't requested
+    default_core_columns = [
+        'tweet_id', 'tweet_link', 'created_date', 'author', 'text', 'Result Flag'
+    ]
+    
+    target_columns = relevant_columns if relevant_columns else default_core_columns
+    target_columns = target_columns[:] # Create a copy to modify
+
+    # --- Ensure necessary columns exist for link and flag generation ---
+    can_make_link = 'tweet_id' in display_df.columns and 'author' in display_df.columns
+    can_make_flag = 'prediction_correct' in display_df.columns
+
+    # Generate tweet_link if possible and requested/default
+    if 'tweet_link' in target_columns and can_make_link and 'tweet_link' not in display_df.columns:
+        display_df['tweet_link'] = display_df.apply(
+            lambda row: f"https://twitter.com/{row['author']}/status/{row['tweet_id']}" if pd.notna(row['tweet_id']) and pd.notna(row['author']) else None, 
+            axis=1
+        )
+    elif 'tweet_link' in target_columns and not can_make_link:
+         target_columns.remove('tweet_link') # Remove if base columns missing
+
+    # Generate Result Flag if possible and requested/default
+    if 'Result Flag' in target_columns and can_make_flag and 'Result Flag' not in display_df.columns:
+        def correctness_flag(val):
+            if pd.isna(val):
+                return "⏳ Pending"
+            elif val == True:
+                return "✅ Correct"
+            elif val == False:
+                return "❌ Incorrect"
+            else:
+                return "❓ Unknown"
+        display_df['Result Flag'] = display_df['prediction_correct'].apply(correctness_flag)
+    elif 'Result Flag' in target_columns and not can_make_flag:
+        target_columns.remove('Result Flag') # Remove if base columns missing
+
+    # --- Filter to available and requested display columns ---
+    available_display_columns = [col for col in target_columns if col in display_df.columns]
+    
+    # Ensure tweet_id is string if present
+    if 'tweet_id' in available_display_columns:
+        display_df['tweet_id'] = display_df['tweet_id'].apply(lambda x: str(int(x)) if pd.notna(x) and isinstance(x, (int, float)) else str(x))
+
+    # Select only the final available columns for display
+    final_df_to_display = display_df[available_display_columns]
+
+    # --- Display in Expander ---
+    with st.expander(title):
+        if final_df_to_display.empty:
+             st.warning("No data available with the selected columns.")
+        else:
+            st.dataframe(final_df_to_display, use_container_width=True, 
+                           column_config={
+                               "tweet_link": st.column_config.LinkColumn("Tweet Link", display_text="🔗")
+                           })
+            
+            # Add a note linking to the main Raw Data page
+            st.caption("For more filtering options and all columns, use the main 'Raw Data' page.")
 
 def analyze_all_traders(df):
     all_traders = get_traders(df)
@@ -646,7 +727,9 @@ def create_overview_dashboard(df):
     overall_accuracy = accuracy_df['prediction_correct'].mean() * 100 if len(accuracy_df) > 0 else 0
     avg_return = parent_tweets['actual_return'].mean() if 'actual_return' in parent_tweets.columns else 0
     
-    col1, col2, col3, col4 = st.columns(4)
+    validation_rate = len(accuracy_df) / len(parent_tweets) * 100 if len(parent_tweets) > 0 else 0
+    
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
         st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -671,8 +754,14 @@ def create_overview_dashboard(df):
         return_class = "positive" if avg_return > 0 else "negative"
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-value {return_class}">{avg_return:.2f}%</div>', unsafe_allow_html=True)
-        st.markdown('<div class="metric-label">Average Return (per prediction)</div>', unsafe_allow_html=True)
-        st.markdown('<div class="metric-note">Based on actual price movement during prediction period</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Average Return</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+    with col5:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value neutral">{validation_rate:.1f}%</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Validation Rate</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-note">{len(accuracy_df)}/{len(parent_tweets)} predictions</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
     
     with st.expander("Show traders with insufficient data"):
@@ -720,6 +809,11 @@ def create_overview_dashboard(df):
         )
         
         st.plotly_chart(fig, use_container_width=True)
+
+        # Show the aggregated top_traders data used in the plot
+        format_and_display_data(top_traders, 
+                                title="Show Aggregated Data for Top Traders Plot",
+                                relevant_columns=['trader', 'accuracy', 'avg_return', 'total_tweets', 'followers'])
     
     with col2:
         st.markdown('<div class="highlight">', unsafe_allow_html=True)
@@ -767,10 +861,16 @@ def create_overview_dashboard(df):
         )
 
         st.plotly_chart(fig, use_container_width=True)
+
+        # Show raw data with relevant columns
+        format_and_display_data(all_parent_tweets, 
+                                title="Show Raw Data for Sentiment Distribution",
+                                relevant_columns=['tweet_id', 'author', 'created_date', 'sentiment'])
     
     with col2:
         stock_counts = df['validated_ticker'].value_counts().nlargest(10).reset_index()
-        stock_counts.columns = ['Stock', 'Count']
+        # Rename columns to match plot expectations
+        stock_counts.columns = ['Stock', 'Count'] 
         
         fig = px.bar(
             stock_counts,
@@ -785,6 +885,13 @@ def create_overview_dashboard(df):
         fig.update_layout(height=400, yaxis={'categoryorder': 'total ascending'})
         
         st.plotly_chart(fig, use_container_width=True)
+
+        # Show filtered raw data with relevant columns
+        top_stocks_list = stock_counts['Stock'].tolist()
+        filtered_raw_stock_data = parent_tweets[parent_tweets['validated_ticker'].isin(top_stocks_list)]
+        format_and_display_data(filtered_raw_stock_data, 
+                                title="Show Raw Data for Top Mentioned Stocks",
+                                relevant_columns=['tweet_id', 'author', 'created_date', 'validated_ticker'])
     
     st.markdown('<div class="sub-header">Time Series Analysis</div>', unsafe_allow_html=True)
     
@@ -858,8 +965,14 @@ def create_overview_dashboard(df):
     fig.update_yaxes(title_text='Percentage (%)', secondary_y=True)
     
     st.plotly_chart(fig, use_container_width=True)
+
+    # Show raw data with relevant columns used in aggregation
+    format_and_display_data(df, 
+                                title="Show Raw Data for Monthly Analysis", 
+                                relevant_columns=['tweet_id', 'author', 'created_date', 'prediction_correct', 'actual_return', 'conversation_id'])
     
     st.markdown('<div class="sub-header">Trader Comparison</div>', unsafe_allow_html=True)
+    
     
     display_df = trader_metrics.sort_values('accuracy', ascending=False).copy()
     display_df.columns = [
@@ -987,8 +1100,9 @@ def create_trader_profile(df, trader_name):
             
             performance_metrics = {
                 "Prediction Accuracy": f"{profile_summary['Prediction Accuracy (%)']:.1f}%" if isinstance(profile_summary['Prediction Accuracy (%)'], float) else profile_summary['Prediction Accuracy (%)'],
-                "Bullish Accuracy": f"{profile_summary['Bullish Accuracy (%)']:.1f}%",
-                "Bearish Accuracy": f"{profile_summary['Bearish Accuracy (%)']:.1f}%",
+                "Validated Predictions": profile_summary["Validated Predictions"],
+                "Bullish Accuracy": profile_summary["Bullish Accuracy Info"],
+                "Bearish Accuracy": profile_summary["Bearish Accuracy Info"],
                 "Successful Predictions": profile_summary["Successful Predictions"],
                 "Failed Predictions": profile_summary["Failed Predictions"],
                 "Pending Predictions": profile_summary["Pending Predictions"],
@@ -1030,6 +1144,11 @@ def create_trader_profile(df, trader_name):
             fig_sentiment.update_traces(textposition='inside', textinfo='percent+label')
             fig_sentiment.update_layout(height=400)
             st.plotly_chart(fig_sentiment, use_container_width=True)
+
+            # Show raw data with relevant columns
+            format_and_display_data(df_parent, 
+                                    title="Show Raw Data for Sentiment Distribution",
+                                    relevant_columns=['tweet_id', 'author', 'created_date', 'sentiment'])
         
         with dist_col2:
             time_horizon_counts = df_parent['time_horizon'].value_counts()
@@ -1043,6 +1162,15 @@ def create_trader_profile(df, trader_name):
             fig_time.update_traces(textposition='inside', textinfo='percent+label')
             fig_time.update_layout(height=400)
             st.plotly_chart(fig_time, use_container_width=True)
+
+            # Show raw data with relevant columns
+            format_and_display_data(df_parent, 
+                                    title="Show Raw Data for Time Horizon Distribution",
+                                    relevant_columns=['tweet_id', 'author', 'created_date', 'time_horizon'])
+        
+        # Add the Raw Data table
+        st.markdown('<div class="sub-header">Raw Data Used for Analysis</div>', unsafe_allow_html=True)
+        st.dataframe(df_parent, use_container_width=True)
     
     with tab2:
         st.markdown('<div class="sub-header">Prediction Performance</div>', unsafe_allow_html=True)
@@ -1075,80 +1203,169 @@ def create_trader_profile(df, trader_name):
             )
             
             st.plotly_chart(fig, use_container_width=True)
+
+            # Show raw data with relevant columns
+            format_and_display_data(df_parent, 
+                                    title="Show Raw Data for Accuracy by Time Horizon",
+                                    relevant_columns=['tweet_id', 'author', 'created_date', 'time_horizon', 'prediction_correct', 'Result Flag'])
         
         with col2:
-            accuracy_by_sentiment = df_parent.groupby('sentiment')['prediction_correct'].mean() * 100
+            # Filter for validated predictions only
+            validated_df = df_parent[df_parent['prediction_correct'].notna()]
             
-            colors = {'bullish': '#17BF63', 'bearish': '#E0245E', 'neutral': '#AAB8C2'}
-            
-            fig = px.bar(
-                x=accuracy_by_sentiment.index,
-                y=accuracy_by_sentiment.values,
-                labels={'x': 'Sentiment', 'y': 'Accuracy (%)'},
-                title='Prediction Accuracy by Sentiment',
-                color=accuracy_by_sentiment.index,
-                color_discrete_map=colors
-            )
-            
-            fig.update_layout(height=400)
-            
-            fig.add_shape(
-                type='line',
-                x0=-0.5,
-                x1=len(accuracy_by_sentiment) - 0.5,
-                y0=50,
-                y1=50,
-                line=dict(color='red', width=2, dash='dash')
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
+            if len(validated_df) > 0:
+                # Prediction accuracy by sentiment with counts
+                accuracy_by_sentiment = validated_df.groupby('sentiment')['prediction_correct'].mean() * 100
+                
+                # Count number of predictions for each sentiment
+                sentiment_counts = validated_df.groupby('sentiment').size()
+                total_counts = df_parent.groupby('sentiment').size()
+                
+                # Add counts to hover text
+                hover_data = pd.DataFrame({
+                    'sentiment': accuracy_by_sentiment.index,
+                    'count': [f"{sentiment_counts.get(sent, 0)}/{total_counts.get(sent, 0)} validated" for sent in accuracy_by_sentiment.index]
+                })
+                
+                colors = {'bullish': '#17BF63', 'bearish': '#E0245E', 'neutral': '#AAB8C2'}
+                
+                fig = px.bar(
+                    x=accuracy_by_sentiment.index,
+                    y=accuracy_by_sentiment.values,
+                    labels={'x': 'Sentiment', 'y': 'Accuracy (%)'},
+                    title='Prediction Accuracy by Sentiment (Validated Predictions Only)',
+                    color=accuracy_by_sentiment.index,
+                    color_discrete_map=colors,
+                    hover_data=[hover_data.set_index('sentiment')['count']]
+                )
+                
+                # Add annotations with counts
+                for i, sentiment in enumerate(accuracy_by_sentiment.index):
+                    fig.add_annotation(
+                        x=sentiment,
+                        y=accuracy_by_sentiment[sentiment] + 5,  # Position above the bar
+                        text=f"{sentiment_counts.get(sentiment, 0)}/{total_counts.get(sentiment, 0)}",
+                        showarrow=False
+                    )
+                
+                fig.update_layout(height=400)
+                
+                fig.add_shape(
+                    type='line',
+                    x0=-0.5,
+                    x1=len(accuracy_by_sentiment) - 0.5,
+                    y0=50,
+                    y1=50,
+                    line=dict(color='red', width=2, dash='dash')
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Show raw data with relevant columns
+                format_and_display_data(df_parent, 
+                                        title="Show Raw Data for Accuracy by Sentiment",
+                                        relevant_columns=['tweet_id', 'author', 'created_date', 'sentiment', 'prediction_correct', 'Result Flag'])
+            else:
+                st.warning("No validated predictions available to calculate accuracy by sentiment.")
         
         st.markdown('<div class="sub-header">Prediction Accuracy Over Time</div>', unsafe_allow_html=True)
         
-        df_parent_sorted = df_parent.sort_values('created_date')
-        df_parent_sorted['rolling_accuracy'] = df_parent_sorted['prediction_correct'].rolling(window=10, min_periods=3).mean() * 100
+        # Filter to only include validated predictions for the chart
+        validated_parent = df_parent[df_parent['prediction_correct'].notna()].copy()
         
-        fig = px.line(
-            df_parent_sorted,
-            x='created_date',
-            y='rolling_accuracy',
-            labels={'created_date': 'Date', 'rolling_accuracy': 'Rolling Accuracy (%)'},
-            title=f'Rolling Prediction Accuracy (10-tweet window) for {trader_name}',
-            color_discrete_sequence=['#1DA1F2']
-        )
-        
-        overall_accuracy = df_parent['prediction_correct'].mean() * 100
-        fig.add_hline(y=overall_accuracy, line_dash="dash", line_color="green", 
-                      annotation_text=f"Overall: {overall_accuracy:.1f}%")
-        fig.add_hline(y=50, line_dash="dot", line_color="red")
-        
-        fig.update_layout(height=400)
-        
-        st.plotly_chart(fig, use_container_width=True)
+        if len(validated_parent) > 0:
+            # Sort by date and calculate rolling accuracy (increase window for more smoothing)
+            df_parent_sorted = validated_parent.sort_values('created_date')
+            
+            # Adjust window size based on amount of data
+            window_size = min(30, max(10, len(df_parent_sorted) // 5))
+            min_periods = min(5, max(3, window_size // 5))
+            
+            df_parent_sorted['rolling_accuracy'] = df_parent_sorted['prediction_correct'].rolling(
+                window=window_size, 
+                min_periods=min_periods
+            ).mean() * 100
+            
+            # Get date range for title
+            date_range = f"{df_parent_sorted['created_date'].min().strftime('%b %Y')} - {df_parent_sorted['created_date'].max().strftime('%b %Y')}"
+            
+            fig = px.line(
+                df_parent_sorted,
+                x='created_date',
+                y='rolling_accuracy',
+                labels={'created_date': 'Date', 'rolling_accuracy': 'Rolling Accuracy (%)'},
+                title=f'Rolling Prediction Accuracy ({window_size}-tweet window) for {trader_name} ({date_range})',
+                color_discrete_sequence=['#1DA1F2']
+            )
+            
+            # Add data count annotation
+            fig.add_annotation(
+                xref="paper", yref="paper",
+                x=0.01, y=0.99,
+                text=f"{len(validated_parent)}/{len(df_parent)} tweets validated",
+                showarrow=False,
+                font=dict(size=12),
+                align="left"
+            )
+            
+            # Add overall accuracy line
+            overall_accuracy = validated_parent['prediction_correct'].mean() * 100
+            fig.add_hline(y=overall_accuracy, line_dash="dash", line_color="green", 
+                        annotation_text=f"Overall: {overall_accuracy:.1f}%")
+            fig.add_hline(y=50, line_dash="dot", line_color="red")
+            
+            # Set date range to focus on the data we have
+            fig.update_xaxes(range=[
+                df_parent_sorted['created_date'].min() - pd.Timedelta(days=1),
+                df_parent_sorted['created_date'].max() + pd.Timedelta(days=1)
+            ])
+            
+            fig.update_layout(height=400)
+            
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Show raw data with relevant columns
+            # Pass df_parent_sorted as it's the relevant subset for rolling calc
+            format_and_display_data(df_parent_sorted, 
+                                    title="Show Raw Data for Rolling Accuracy", 
+                                    relevant_columns=['tweet_id', 'author', 'created_date', 'prediction_correct', 'Result Flag'])
+        else:
+            st.warning("No validated predictions available to calculate accuracy over time.")
         
         st.markdown('<div class="sub-header">Price Change vs Prediction Correctness</div>', unsafe_allow_html=True)
         
-        fig = px.scatter(
-            df_parent,
-            x='price_change_pct',
-            y='actual_return',
-            color='prediction_correct',
-            color_discrete_map={True: '#17BF63', False: '#E0245E'},
-            labels={
-                'price_change_pct': 'Price Change (%)',
-                'actual_return': 'Actual Return (%)',
-                'prediction_correct': 'Prediction Correct'
-            },
-            title='Price Change vs Actual Return by Prediction Correctness',
-            hover_data=['validated_ticker', 'sentiment', 'created_date']
-        )
+        # Filter to only include validated predictions
+        validated_df = df_parent[df_parent['prediction_correct'].notna()]
         
-        fig.update_layout(height=500)
-        
-        fig.add_hline(y=0, line_dash="dash", line_color="gray")
-        fig.add_vline(x=0, line_dash="dash", line_color="gray")
-        
-        st.plotly_chart(fig, use_container_width=True)
+        if len(validated_df) > 0:
+            fig = px.scatter(
+                validated_df,
+                x='price_change_pct',
+                y='actual_return',
+                color='prediction_correct',
+                color_discrete_map={True: '#17BF63', False: '#E0245E'},
+                labels={
+                    'price_change_pct': 'Price Change (%)',
+                    'actual_return': 'Actual Return (%)',
+                    'prediction_correct': 'Prediction Correct'
+                },
+                title=f'Price Change vs Actual Return ({len(validated_df)} validated predictions)',
+                hover_data=['validated_ticker', 'sentiment', 'created_date']
+            )
+            
+            fig.update_layout(height=500)
+            
+            fig.add_hline(y=0, line_dash="dash", line_color="gray")
+            fig.add_vline(x=0, line_dash="dash", line_color="gray")
+            
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Show raw data with relevant columns
+            format_and_display_data(validated_df, # Use validated subset shown in plot
+                                    title="Show Raw Data for Price Change vs Return",
+                                    relevant_columns=['tweet_id', 'author', 'created_date', 'validated_ticker', 'sentiment', 'prediction_correct', 'Result Flag', 'price_change_pct', 'actual_return'])
+        else:
+            st.warning("No validated predictions available for price change analysis.")
     
     with tab3:
         st.markdown('<div class="sub-header">Sentiment Analysis</div>', unsafe_allow_html=True)
@@ -1186,6 +1403,11 @@ def create_trader_profile(df, trader_name):
             )
             
             st.plotly_chart(fig, use_container_width=True)
+
+            # Show raw data with relevant columns
+            format_and_display_data(df_parent, 
+                                    title="Show Raw Data for Sentiment Over Time",
+                                    relevant_columns=['tweet_id', 'author', 'created_date', 'sentiment'])
         
         with col2:
             engagement_by_sentiment = df_parent.groupby('sentiment').agg({
@@ -1215,6 +1437,11 @@ def create_trader_profile(df, trader_name):
             fig.update_layout(height=400)
             
             st.plotly_chart(fig, use_container_width=True)
+
+            # Show raw data with relevant columns
+            format_and_display_data(df_parent, 
+                                    title="Show Raw Data for Average Engagement",
+                                    relevant_columns=['tweet_id', 'author', 'created_date', 'sentiment', 'likes', 'retweets', 'replies_count'])
         
         st.markdown('<div class="sub-header">Sentiment Consistency Analysis</div>', unsafe_allow_html=True)
         
@@ -1238,6 +1465,11 @@ def create_trader_profile(df, trader_name):
                          annotation_text=f"Mean: {mean_consistency:.1f}%")
             
             st.plotly_chart(fig, use_container_width=True)
+
+            # Show raw data (df_user includes replies) with relevant columns
+            format_and_display_data(df_user, 
+                                    title="Show Raw Data for Sentiment Consistency",
+                                    relevant_columns=['tweet_id', 'author', 'created_date', 'conversation_id', 'sentiment', 'parent_sentiment', 'consistent_sentiment'])
         
         with col2:
             sentiment_return = df_parent.groupby('sentiment').agg({
@@ -1272,6 +1504,11 @@ def create_trader_profile(df, trader_name):
             fig.add_hline(y=0, line_dash="dash", line_color="gray")
             
             st.plotly_chart(fig, use_container_width=True)
+
+            # Show raw data with relevant columns
+            format_and_display_data(df_parent, 
+                                    title="Show Raw Data for Average Return by Sentiment",
+                                    relevant_columns=['tweet_id', 'author', 'created_date', 'sentiment', 'actual_return', 'prediction_correct', 'Result Flag'])
     
     with tab4:
         st.markdown('<div class="sub-header">Stock Performance Analysis</div>', unsafe_allow_html=True)
@@ -1293,6 +1530,13 @@ def create_trader_profile(df, trader_name):
             fig.update_layout(height=400)
             
             st.plotly_chart(fig, use_container_width=True)
+
+            # Show raw data filtered to top stocks
+            top_stocks_list = top_stocks.index.tolist() # Get tickers from top_stocks series
+            filtered_data = df_parent[df_parent['validated_ticker'].isin(top_stocks_list)]
+            format_and_display_data(filtered_data, 
+                                    title="Show Raw Data for Top Mentioned Stocks",
+                                    relevant_columns=['tweet_id', 'author', 'created_date', 'validated_ticker'])
         
         with col2:
             stock_accuracy = df_parent.groupby('validated_ticker')['prediction_correct'].agg(['mean', 'count'])
@@ -1325,6 +1569,13 @@ def create_trader_profile(df, trader_name):
             fig.add_hline(y=50, line_dash="dash", line_color="red")
             
             st.plotly_chart(fig, use_container_width=True)
+
+            # Show raw data filtered to stocks with >= 3 preds
+            stocks_in_plot = plot_df['Stock'].tolist() # Get tickers from plot_df
+            filtered_data = df_parent[df_parent['validated_ticker'].isin(stocks_in_plot)]
+            format_and_display_data(filtered_data, 
+                                    title="Show Raw Data for Accuracy by Stock",
+                                    relevant_columns=['tweet_id', 'author', 'created_date', 'validated_ticker', 'prediction_correct', 'Result Flag'])
         
         st.markdown('<div class="sub-header">Stock Return Analysis</div>', unsafe_allow_html=True)
         
@@ -1378,6 +1629,13 @@ def create_trader_profile(df, trader_name):
         fig.update_layout(height=600)
         
         st.plotly_chart(fig, use_container_width=True)
+
+        # Show raw data filtered to stocks with >= 3 preds
+        stocks_in_plot = scatter_df['stock'].tolist() # Get tickers from scatter_df
+        filtered_data = df_parent[df_parent['validated_ticker'].isin(stocks_in_plot)]
+        format_and_display_data(filtered_data, 
+                                title="Show Raw Data for Accuracy vs Return", 
+                                relevant_columns=['tweet_id', 'author', 'created_date', 'validated_ticker', 'prediction_correct', 'Result Flag', 'actual_return', 'price_change_pct'])
         
         col1, col2 = st.columns(2)
         
@@ -1388,6 +1646,13 @@ def create_trader_profile(df, trader_name):
             top_performing['Avg Return (%)'] = top_performing['Avg Return (%)'].round(2)
             top_performing['Price Change (%)'] = top_performing['Price Change (%)'].round(2)
             st.dataframe(top_performing, use_container_width=True)
+
+            # Show raw data filtered to top 5 stocks
+            top_5_stocks = top_performing['Stock'].tolist()
+            filtered_data = df_parent[df_parent['validated_ticker'].isin(top_5_stocks)]
+            format_and_display_data(filtered_data, 
+                                    title="Show Raw Data for Top Performing Stocks",
+                                    relevant_columns=['tweet_id', 'author', 'created_date', 'validated_ticker', 'actual_return', 'price_change_pct', 'prediction_correct', 'Result Flag'])
         
         with col2:
             st.markdown("### Bottom 5 Performing Stocks")
@@ -1396,214 +1661,17 @@ def create_trader_profile(df, trader_name):
             bottom_performing['Avg Return (%)'] = bottom_performing['Avg Return (%)'].round(2)
             bottom_performing['Price Change (%)'] = bottom_performing['Price Change (%)'].round(2)
             st.dataframe(bottom_performing, use_container_width=True)
-        
-        st.markdown('<div class="sub-header">Feature Distributions</div>', unsafe_allow_html=True)
-        
-        dist_cols = st.columns(2)
-        
-        with dist_cols[0]:
-            time_horizon_counts = df_parent['time_horizon'].value_counts()
-            fig_time = px.pie(
-                values=time_horizon_counts.values,
-                names=time_horizon_counts.index,
-                title='Time Horizon Distribution',
-                hole=0.4,
-                color_discrete_sequence=['#1DA1F2', '#AAB8C2', '#657786', '#14171A', '#E1E8ED', '#F5F8FA']
-            )
-            fig_time.update_traces(textposition='inside', textinfo='percent+label')
-            fig_time.update_layout(showlegend=True, height=300)
-            st.plotly_chart(fig_time, use_container_width=True)
 
-        with dist_cols[1]:
-            sentiment_counts = df_parent['sentiment'].value_counts()
-            fig_sentiment = px.pie(
-                values=sentiment_counts.values,
-                names=sentiment_counts.index,
-                title='Sentiment Distribution',
-                hole=0.4,
-                color=sentiment_counts.index,
-                color_discrete_map={
-                    'bullish': '#17BF63',
-                    'bearish': '#E0245E',
-                    'neutral': '#AAB8C2'
-                }
-            )
-            fig_sentiment.update_traces(textposition='inside', textinfo='percent+label')
-            fig_sentiment.update_layout(showlegend=True, height=300)
-            st.plotly_chart(fig_sentiment, use_container_width=True)
-
-def create_raw_data_dashboard(df):
-    st.markdown("<h1 class='main-header'>Raw Data Explorer</h1>", unsafe_allow_html=True)
-    
-    tabs = st.tabs(["Raw Data", "Data Statistics"])
-    
-    with tabs[0]:
-        st.markdown("<h2 class='sub-header'>Raw Data</h2>", unsafe_allow_html=True)
+            # Show raw data filtered to bottom 5 stocks
+            bottom_5_stocks = bottom_performing['Stock'].tolist()
+            filtered_data = df_parent[df_parent['validated_ticker'].isin(bottom_5_stocks)]
+            format_and_display_data(filtered_data, 
+                                    title="Show Raw Data for Bottom Performing Stocks",
+                                    relevant_columns=['tweet_id', 'author', 'created_date', 'validated_ticker', 'actual_return', 'price_change_pct', 'prediction_correct', 'Result Flag'])
         
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if 'author' in df.columns:
-                authors = ["All"] + sorted(df["author"].unique().tolist())
-                selected_author = st.selectbox("Filter by Trader", authors)
-            else:
-                selected_author = "All"
-                st.info("No author column found in the data")
-        
-        with col2:
-            if 'tickers_mentioned' in df.columns:
-                first_tickers = df['tickers_mentioned'].apply(lambda x: x.split(',')[0].strip() if isinstance(x, str) and ',' in x else x)
-                tickers = ["All"] + sorted(first_tickers.unique().tolist())
-                selected_ticker = st.selectbox("Filter by Ticker", tickers)
-            elif 'ticker' in df.columns:
-                tickers = ["All"] + sorted(df["ticker"].unique().tolist())
-                selected_ticker = st.selectbox("Filter by Ticker", tickers)
-            else:
-                selected_ticker = "All"
-                st.info("No ticker column found in the data")
-        
-        with col3:
-            dates = ["All", "Last 7 Days", "Last 30 Days", "Last 90 Days", "Last 365 Days"]
-            selected_date = st.selectbox("Filter by Date", dates, key="date_filter")
-        
-        filtered_df = df.copy()
-        
-        if selected_author != "All":
-            if 'author' in df.columns:
-                filtered_df = filtered_df[filtered_df["author"] == selected_author]
-        
-        if selected_ticker != "All":
-            if 'tickers_mentioned' in df.columns:
-                filtered_df = filtered_df[filtered_df['tickers_mentioned'].apply(
-                    lambda x: selected_ticker in [t.strip() for t in x.split(',')] if isinstance(x, str) else False
-                )]
-            elif 'ticker' in df.columns:
-                filtered_df = filtered_df[filtered_df["ticker"] == selected_ticker]
-        
-        if selected_date != "All":
-            date_columns = []
-            for col in df.columns:
-                if 'date' in col.lower() or col.lower() == 'date':
-                    date_columns.append(col)
-            
-            if date_columns:
-                date_col = date_columns[0]
-                max_date = df[date_col].max()
-                days = int(selected_date.split()[1])
-                cutoff_date = max_date - timedelta(days=days)
-                filtered_df = filtered_df[filtered_df[date_col] >= cutoff_date]
-        
-        st.dataframe(filtered_df, use_container_width=True)
-        
-        csv = filtered_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Download Filtered Data as CSV",
-            data=csv,
-            file_name=f"twitter_trader_data_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-        )
-    
-    with tabs[1]:
-        st.markdown("<h2 class='sub-header'>Data Statistics</h2>", unsafe_allow_html=True)
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("<div class='card'>", unsafe_allow_html=True)
-            st.markdown("<h3>Numerical Statistics</h3>", unsafe_allow_html=True)
-            
-            num_cols = df.select_dtypes(include=['float64', 'int64']).columns.tolist()
-            if num_cols:
-                num_stats = df[num_cols].describe().T
-                num_stats = num_stats.reset_index()
-                num_stats.columns = ['Column', 'Count', 'Mean', 'Std', 'Min', '25%', '50%', '75%', 'Max']
-                st.dataframe(num_stats, use_container_width=True)
-            else:
-                st.info("No numerical columns found in the dataset.")
-            
-            st.markdown("</div>", unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown("<div class='card'>", unsafe_allow_html=True)
-            st.markdown("<h3>Categorical Statistics</h3>", unsafe_allow_html=True)
-            
-            cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
-            
-            if cat_cols:
-                selected_cat_col = st.selectbox("Select Categorical Column", cat_cols)
-                
-                val_counts = df[selected_cat_col].value_counts().reset_index()
-                val_counts.columns = [selected_cat_col, 'Count']
-                
-                fig = px.bar(
-                    val_counts.head(20), 
-                    x='Count', 
-                    y=selected_cat_col,
-                    orientation='h',
-                    title=f'Top 20 Values in {selected_cat_col}',
-                    color='Count',
-                    color_continuous_scale='blues'
-                )
-                
-                fig.update_layout(
-                    height=600,
-                    xaxis_title='Count',
-                    yaxis_title=selected_cat_col,
-                    yaxis={'categoryorder':'total ascending'}
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No categorical columns found in the dataset.")
-                
-            st.markdown("</div>", unsafe_allow_html=True)
-        
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("<h3>Dataset Summary</h3>", unsafe_allow_html=True)
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Total Records", f"{len(df):,}")
-        
-        with col2:
-            if 'author' in df.columns:
-                st.metric("Number of Traders", f"{df['author'].nunique():,}")
-            else:
-                st.metric("Number of Traders", "N/A")
-        
-        with col3:
-            if 'ticker' in df.columns:
-                st.metric("Number of Tickers", f"{df['ticker'].nunique():,}")
-            elif 'tickers_mentioned' in df.columns:
-                st.metric("Number of Tickers", f"{df['tickers_mentioned'].nunique():,}")
-            else:
-                st.metric("Number of Tickers", "N/A")
-        
-        with col4:
-            date_columns = []
-            for col in df.columns:
-                if 'date' in col.lower() or col.lower() == 'date':
-                    date_columns.append(col)
-            
-            if date_columns:
-                date_col = date_columns[0]
-                date_range = f"{df[date_col].min().date()} to {df[date_col].max().date()}"
-                st.metric("Date Range", date_range)
-            else:
-                st.metric("Date Range", "N/A")
-            
-        st.markdown("</div>", unsafe_allow_html=True)
-
-def load_twitter_llm_module():
-    try:
-        spec = importlib.util.spec_from_file_location("twitter_llm", "twitter-llms-optimized.py")
-        twitter_llm = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(twitter_llm)
-        return twitter_llm
-    except Exception as e:
-        st.error(f"Error loading Twitter LLM module: {str(e)}")
-        return None
+        # ... (Remove the Feature Distributions section at the end as it duplicates tab1 plots) ...
+        # st.markdown('<div class="sub-header">Feature Distributions</div>', unsafe_allow_html=True)
+        # format_and_display_data(df_parent, "Show Raw Data for Feature Distributions")
 
 def create_data_extraction_dashboard():
     if 'twitter_data' not in st.session_state:
@@ -1854,7 +1922,6 @@ def create_data_extraction_dashboard():
                                 )
                                 
                                 llm_response = response.choices[0].message.content
-                                
                                 author_info = tweet_data.get('author', {})
                                 author_name = author_info.get('userName', '') if isinstance(author_info, dict) else ''
                                 
@@ -2193,6 +2260,163 @@ def main():
         "from Twitter conversations."
     )
     st.sidebar.markdown("2025 Twitter Trader Analysis")
+
+# -------- INSERT create_raw_data_dashboard HERE --------
+def create_raw_data_dashboard(df):
+    st.markdown("<h1 class='main-header'>Raw Data Explorer</h1>", unsafe_allow_html=True)
+    
+    st.markdown("<h2 class='sub-header'>Filters</h2>", unsafe_allow_html=True)
+
+    # --- Filter Row 1 ---
+    filter_cols_1 = st.columns(4)
+    with filter_cols_1[0]:
+        if 'author' in df.columns:
+            authors = ["All"] + sorted(df["author"].dropna().unique().tolist())
+            selected_author = st.selectbox("Filter by Trader", authors)
+        else:
+            selected_author = "All"
+            st.info("No author column found")
+
+    with filter_cols_1[1]:
+        if 'validated_ticker' in df.columns:
+            tickers = ["All"] + sorted(df["validated_ticker"].dropna().unique().tolist())
+            selected_ticker = st.selectbox("Filter by Ticker", tickers)
+        elif 'tickers_mentioned' in df.columns:
+             # Handle comma-separated tickers if necessary
+            all_tickers = set()
+            df['tickers_mentioned'].dropna().apply(lambda x: all_tickers.update(t.strip() for t in str(x).split(',') if t.strip()))
+            tickers = ["All"] + sorted(list(all_tickers))
+            selected_ticker = st.selectbox("Filter by Ticker", tickers)
+        else:
+            selected_ticker = "All"
+            st.info("No ticker column found")
+
+    with filter_cols_1[2]:
+        sentiments = ["All"] + df['sentiment'].dropna().unique().tolist()
+        selected_sentiment = st.selectbox("Filter by Sentiment", sentiments)
+
+    with filter_cols_1[3]:
+        correctness_options = {
+            "All": None, 
+            "Correct": True, 
+            "Incorrect": False, 
+            "Pending": pd.NA
+        }
+        selected_correctness_label = st.selectbox(
+            "Filter by Prediction Correctness", 
+            options=list(correctness_options.keys()),
+            index=0
+        )
+        selected_correctness = correctness_options[selected_correctness_label]
+
+    # --- Filter Row 2 ---
+    filter_cols_2 = st.columns(4)
+    with filter_cols_2[0]:
+        if 'created_date' in df.columns:
+            min_date = df['created_date'].min().date()
+            max_date = df['created_date'].max().date()
+            
+            # Check if min_date and max_date are the same
+            if min_date == max_date:
+                st.info(f"Data available only for {min_date}")
+                selected_date_range = (min_date, max_date)
+            elif min_date > max_date: # Handle potential data issue
+                 st.warning("Min date is after max date. Check data.")
+                 selected_date_range = (min_date, min_date) # Default to min_date
+            else:
+                selected_date_range = st.date_input(
+                    "Filter by Date Range",
+                    value=(min_date, max_date),
+                    min_value=min_date,
+                    max_value=max_date,
+                )
+        else:
+            selected_date_range = None
+            st.info("No date column for filtering")
+
+    # --- Apply Filters ---
+    filtered_df = df.copy()
+
+    if selected_author != "All":
+        if 'author' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df["author"] == selected_author]
+
+    if selected_ticker != "All":
+        if 'validated_ticker' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df["validated_ticker"] == selected_ticker]
+        elif 'tickers_mentioned' in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df['tickers_mentioned'].apply(
+                lambda x: selected_ticker in [t.strip() for t in str(x).split(',')] if pd.notna(x) else False
+            )]
+
+    if selected_sentiment != "All":
+        filtered_df = filtered_df[filtered_df["sentiment"] == selected_sentiment]
+
+    # Handle the prediction correctness filter, including NA for Pending
+    if selected_correctness_label != "All":
+        if pd.isna(selected_correctness):
+            filtered_df = filtered_df[filtered_df['prediction_correct'].isna()]
+        else:
+            filtered_df = filtered_df[filtered_df['prediction_correct'] == selected_correctness]
+
+    if selected_date_range and 'created_date' in filtered_df.columns and len(selected_date_range) == 2:
+        start_date, end_date = selected_date_range
+        # Convert to datetime if they are date objects
+        start_datetime = pd.to_datetime(start_date)
+        end_datetime = pd.to_datetime(end_date) + pd.Timedelta(days=1) # Make end date inclusive
+        filtered_df = filtered_df[(filtered_df['created_date'] >= start_datetime) & (filtered_df['created_date'] < end_datetime)]
+
+    st.markdown("<h2 class='sub-header'>Filtered Data</h2>", unsafe_allow_html=True)
+
+    # Use helper function to display the filtered data
+    # Note: Pass the filtered_df to the helper
+    format_and_display_data(filtered_df, "Filtered Raw Data Details") 
+    
+    # --- Recalculate display columns for download ---
+    display_df_for_download = filtered_df.copy()
+    display_columns = [
+        'tweet_id', 'tweet_link', 'created_date', 'author', 'text', 
+        'sentiment', 'time_horizon', 'trade_type', 'validated_ticker',
+        'prediction_correct', 'Result Flag', 'actual_return', 'price_change_pct',
+        'start_date', 'end_date', 'start_price', 'end_price'
+    ]
+    if 'tweet_id' in display_df_for_download.columns and 'author' in display_df_for_download.columns and 'tweet_link' not in display_df_for_download.columns:
+        display_df_for_download['tweet_link'] = display_df_for_download.apply(lambda row: f"https://twitter.com/{row['author']}/status/{row['tweet_id']}" if pd.notna(row['tweet_id']) and pd.notna(row['author']) else None, axis=1)
+    if 'prediction_correct' in display_df_for_download.columns and 'Result Flag' not in display_df_for_download.columns:
+        def correctness_flag(val): # Redefine locally for robustness
+            if pd.isna(val): return "⏳ Pending"
+            elif val == True: return "✅ Correct"
+            elif val == False: return "❌ Incorrect"
+            else: return "❓ Unknown"
+        display_df_for_download['Result Flag'] = display_df_for_download['prediction_correct'].apply(correctness_flag)
+    
+    # Filter to only available columns for download
+    available_columns_for_download = [col for col in display_columns if col in display_df_for_download.columns]
+    
+    if 'tweet_id' in display_df_for_download.columns:
+         display_df_for_download['tweet_id'] = display_df_for_download['tweet_id'].apply(lambda x: str(int(x)) if pd.notna(x) and isinstance(x, (int, float)) else str(x))
+    
+    display_df_for_download = display_df_for_download[available_columns_for_download]
+    # --- End Recalculation ---
+
+    csv = display_df_for_download.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="Download Filtered Data as CSV",
+        data=csv,
+        file_name=f"twitter_filtered_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+    )
+# -------- END INSERT --------
+
+def load_twitter_llm_module():
+    try:
+        spec = importlib.util.spec_from_file_location("twitter_llm", "twitter-llms-optimized.py")
+        twitter_llm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(twitter_llm)
+        return twitter_llm
+    except Exception as e:
+        st.error(f"Error loading Twitter LLM module: {str(e)}")
+        return None
 
 if __name__ == "__main__":
     if check_password():
