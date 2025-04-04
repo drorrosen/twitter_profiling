@@ -1890,7 +1890,6 @@ def create_data_extraction_dashboard():
                         # --- Store tweets in session state --- 
                         try:
                             # Convert to DataFrame before storing
-                            import pandas as pd # Add import here
                             df_tweets = pd.DataFrame(tweets)
                             st.session_state.twitter_data = df_tweets
                             print(f"Stored {len(df_tweets)} tweets into session state.")
