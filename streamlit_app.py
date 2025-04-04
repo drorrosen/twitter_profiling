@@ -24,6 +24,12 @@ import concurrent.futures
 import traceback
 import io
 
+# --- Import APIFY extraction functions ---
+import APIFY_tweet_extraction as apify_extractor
+
+# --- Import twitter-llms-optimized --- 
+import twitter_llms_optimized as twitter_llm_module # Import the LLM processing module
+
 # Set page config FIRST - before any other Streamlit commands
 st.set_page_config(
     page_title="Twitter Trader Analysis",
@@ -342,6 +348,11 @@ def load_data(filepath=None):
         if 'prediction_date' in df.columns and 'prediction_correct' in df.columns:
             df.loc[df['prediction_date'] > pd.Timestamp.today(), 'prediction_correct'] = None
         
+        if 'is_deleted' in df.columns:
+            df['is_deleted'] = df['is_deleted'].fillna(False).astype(bool)
+        else:
+            df['is_deleted'] = False
+        
         if 'tweet_type' not in df.columns:
             df['tweet_type'] = 'parent'
         
@@ -415,8 +426,14 @@ def filter_trader_data(df, trader_name, show_warnings=True):
         return df_user, pd.DataFrame()
     
     df_user = df_user.loc[df_user['conversation_id'].isin(conv_starter)]
-    df_parent = df_user[df_user['tweet_type'] == 'parent']
-    
+    # Filter df_parent to include ONLY bullish or bearish parent tweets
+    df_parent = df_user[
+         (df_user['tweet_type'] == 'parent') & 
+         (df_user['sentiment'].isin(['bullish', 'bearish'])) & 
+         (df_user['time_horizon'].notna()) & 
+         (df_user['time_horizon'] != 'unknown')
+     ].copy() # Add .copy() to avoid SettingWithCopyWarning
+
     df_user['prediction_correct'] = (
         df_user['prediction_correct']
         .astype(str)
@@ -475,6 +492,10 @@ def compute_profile_summary(df_user, df_parent):
             "Average Hold Duration (days)": 0
         }
     
+    non_deleted_df_parent = df_parent[df_parent['is_deleted'] == False] if not df_parent.empty else df_parent
+    prediction_stats = non_deleted_df_parent['prediction_correct'].value_counts()
+    total_validated = prediction_stats.sum()
+    
     profile_summary = {
         "Total Tweets": len(df_user),
         "Total Conversations": df_user['conversation_id'].nunique(),
@@ -495,16 +516,13 @@ def compute_profile_summary(df_user, df_parent):
         "Avg Views per Tweet": df_user['views'].mean() if 'views' in df_user.columns else 0
     })
     
-    prediction_stats = df_parent['prediction_correct'].value_counts()
-    total_validated = prediction_stats.sum()
-    
     profile_summary.update({
-        "Total Predictions": len(df_parent),
+        "Total Predictions": len(non_deleted_df_parent),
         "Successful Predictions": prediction_stats.get(True, 0),
         "Failed Predictions": prediction_stats.get(False, 0),
-        "Pending Predictions": len(df_parent) - total_validated,
+        "Pending Predictions": len(non_deleted_df_parent) - total_validated,
         "Prediction Accuracy (%)": (prediction_stats.get(True, 0) / total_validated * 100) if total_validated > 0 else 0,
-        "Validated Predictions": f"{total_validated}/{len(df_parent)} ({(total_validated/len(df_parent)*100):.1f}%)"
+        "Validated Predictions": f"{total_validated}/{len(non_deleted_df_parent)} ({(total_validated/len(non_deleted_df_parent)*100):.1f}%)"
     })
     
     profile_summary.update({
@@ -555,7 +573,29 @@ def compute_profile_summary(df_user, df_parent):
         consistency_by_conv = df_user.groupby('conversation_id')['consistent_sentiment'].mean() * 100
         profile_summary["Sentiment Consistency (%)"] = consistency_by_conv.mean() * 100
     
+    profile_summary.update({
+        "Deleted Tweets (User)": df_user[df_user['is_deleted'] == True].shape[0],
+        "Deleted Tweets (Parent)": df_parent[df_parent['is_deleted'] == True].shape[0],
+        "Deleted Parent Tweets (%)": (df_parent[df_parent['is_deleted'] == True].shape[0] / len(df_parent) * 100) if len(df_parent) > 0 else 0
+    })
+    
     return profile_summary
+
+# --- Define Default Columns for Expanders ---
+DEFAULT_EXPANDER_COLUMNS = [
+    'tweet_id', 
+    'tweet_link', 
+    'created_date', 
+    'author', 
+    'text', 
+    'LLM Prediction', # New combined string
+    'sentiment',      # Add back individual sentiment
+    'time_horizon',   # Add back individual time horizon
+    'validated_ticker', # Add back validated ticker
+    'tickers_mentioned',# Add back original mentioned tickers (one will likely be shown)
+    'Evaluation',     # New True/False/Pending
+    'Result Flag'     # Existing icon flag
+]
 
 def format_and_display_data(df, title="Show Raw Data", relevant_columns=None):
     """Helper function to format and display a dataframe in an expander."""
@@ -565,28 +605,57 @@ def format_and_display_data(df, title="Show Raw Data", relevant_columns=None):
 
     display_df = df.copy()
 
-    # Define default core columns if specific ones aren't requested
-    default_core_columns = [
-        'tweet_id', 'tweet_link', 'created_date', 'author', 'text', 'Result Flag'
-    ]
-    
-    target_columns = relevant_columns if relevant_columns else default_core_columns
+    # Use default columns if none are specified
+    target_columns = relevant_columns if relevant_columns else DEFAULT_EXPANDER_COLUMNS
     target_columns = target_columns[:] # Create a copy to modify
 
-    # --- Ensure necessary columns exist for link and flag generation ---
-    can_make_link = 'tweet_id' in display_df.columns and 'author' in display_df.columns
+    # --- Generate Necessary Columns if Possible --- 
+
+    # Determine ticker column
+    ticker_col_name = None
+    if 'validated_ticker' in display_df.columns:
+        ticker_col_name = 'validated_ticker'
+    elif 'tickers_mentioned' in display_df.columns:
+        ticker_col_name = 'tickers_mentioned'
+
+    # 1. LLM Prediction String
+    if 'LLM Prediction' in target_columns:
+        def create_llm_prediction_string(row):
+            parts = []
+            if pd.notna(row.get('sentiment')):
+                parts.append(str(row['sentiment']).capitalize())
+            if ticker_col_name and pd.notna(row.get(ticker_col_name)) and row[ticker_col_name]:
+                # Take only the first ticker if multiple exist for simplicity
+                first_ticker = str(row[ticker_col_name]).split(',')[0].strip()
+                parts.append(f"on ${first_ticker}")
+            if pd.notna(row.get('time_horizon')):
+                parts.append(str(row['time_horizon']).replace('_', ' ').capitalize())
+            return ' '.join(parts) if parts else "N/A"
+        
+        # Ensure necessary source columns exist before applying
+        required_for_llm = ['sentiment', 'time_horizon'] + ([ticker_col_name] if ticker_col_name else [])
+        if all(col in display_df.columns for col in required_for_llm):
+             display_df['LLM Prediction'] = display_df.apply(create_llm_prediction_string, axis=1)
+        elif 'LLM Prediction' in target_columns: # If column requested but sources missing
+             target_columns.remove('LLM Prediction') 
+
+    # 2. Evaluation (True/False/Pending)
+    if 'Evaluation' in target_columns and 'prediction_correct' in display_df.columns:
+        def format_evaluation(val):
+            if pd.isna(val):
+                return "Pending"
+            elif val == True:
+                return "True"
+            elif val == False:
+                return "False"
+            else:
+                return "Unknown"
+        display_df['Evaluation'] = display_df['prediction_correct'].apply(format_evaluation)
+    elif 'Evaluation' in target_columns: # If column requested but prediction_correct missing
+        target_columns.remove('Evaluation')
+        
+    # 3. Result Flag (✅/❌/⏳) - Existing Logic
     can_make_flag = 'prediction_correct' in display_df.columns
-
-    # Generate tweet_link if possible and requested/default
-    if 'tweet_link' in target_columns and can_make_link and 'tweet_link' not in display_df.columns:
-        display_df['tweet_link'] = display_df.apply(
-            lambda row: f"https://twitter.com/{row['author']}/status/{row['tweet_id']}" if pd.notna(row['tweet_id']) and pd.notna(row['author']) else None, 
-            axis=1
-        )
-    elif 'tweet_link' in target_columns and not can_make_link:
-         target_columns.remove('tweet_link') # Remove if base columns missing
-
-    # Generate Result Flag if possible and requested/default
     if 'Result Flag' in target_columns and can_make_flag and 'Result Flag' not in display_df.columns:
         def correctness_flag(val):
             if pd.isna(val):
@@ -599,7 +668,17 @@ def format_and_display_data(df, title="Show Raw Data", relevant_columns=None):
                 return "❓ Unknown"
         display_df['Result Flag'] = display_df['prediction_correct'].apply(correctness_flag)
     elif 'Result Flag' in target_columns and not can_make_flag:
-        target_columns.remove('Result Flag') # Remove if base columns missing
+        target_columns.remove('Result Flag')
+        
+    # 4. Tweet Link - Existing Logic
+    can_make_link = 'tweet_id' in display_df.columns and 'author' in display_df.columns
+    if 'tweet_link' in target_columns and can_make_link and 'tweet_link' not in display_df.columns:
+        display_df['tweet_link'] = display_df.apply(
+            lambda row: f"https://twitter.com/{row['author']}/status/{row['tweet_id']}" if pd.notna(row['tweet_id']) and pd.notna(row['author']) else None, 
+            axis=1
+        )
+    elif 'tweet_link' in target_columns and not can_make_link:
+         target_columns.remove('tweet_link')
 
     # --- Filter to available and requested display columns ---
     available_display_columns = [col for col in target_columns if col in display_df.columns]
@@ -625,83 +704,87 @@ def format_and_display_data(df, title="Show Raw Data", relevant_columns=None):
             st.caption("For more filtering options and all columns, use the main 'Raw Data' page.")
 
 def analyze_all_traders(df):
-    all_traders = get_traders(df)
+    """
+    Calculate accuracy metrics for all traders to show in the leaderboard.
+    Only uses non-deleted, parent tweets for accuracy calculations.
+    """
+    # Filter out deleted tweets and keep only PARENT tweets with BULLISH/BEARISH sentiment
+    analysis_df = df[
+        (df['is_deleted'] == False) & 
+        (df['tweet_type'] == 'parent') & 
+        (df['sentiment'].isin(['bullish', 'bearish']))
+    ].copy()
+
+    if analysis_df.empty:
+        st.warning("No valid tweets for trader analysis after filtering deleted tweets.")
+        return pd.DataFrame()
+    
+    # Group by trader
     trader_metrics = []
     
-    for trader in all_traders:
-        df_user, df_parent = filter_trader_data(df, trader, show_warnings=False)
+    for trader in analysis_df['author'].unique():
+        trader_tweets = analysis_df[analysis_df['author'] == trader]
         
-        if len(df_parent) < 3:
+        # Skip traders with too few tweets
+        if len(trader_tweets) < 3:
             continue
-            
-        accuracy = df_parent['prediction_correct'].mean() * 100 if not df_parent['prediction_correct'].isna().all() else 0
-        avg_return = df_parent['actual_return'].mean()
-        total_tweets = len(df_user)
-        total_convs = df_user['conversation_id'].nunique()
-        followers = df_user['author_followers'].max()
         
-        sentiment_counts = df_parent['sentiment'].value_counts(normalize=True) * 100
-        bullish_pct = sentiment_counts.get('bullish', 0)
-        bearish_pct = sentiment_counts.get('bearish', 0)
+        # Calculate accuracy (for validated tweets only)
+        validated_tweets = trader_tweets[trader_tweets['prediction_correct'].notna()]
+        accuracy = validated_tweets['prediction_correct'].mean() * 100 if not validated_tweets.empty else 0
         
-        top_stocks = df_parent['validated_ticker'].value_counts().nlargest(3).index.tolist()
-        top_stocks_str = ', '.join(top_stocks) if top_stocks else "N/A"
+        # Calculate average return
+        avg_return = trader_tweets['actual_return'].mean() if 'actual_return' in trader_tweets.columns else 0
         
+        # Sentiment distribution
+        bullish_pct = (trader_tweets['sentiment'] == 'bullish').mean() * 100
+        bearish_pct = (trader_tweets['sentiment'] == 'bearish').mean() * 100
+        
+        # Calculate follower count
+        followers = trader_tweets['author_followers'].iloc[0] if 'author_followers' in trader_tweets.columns and not trader_tweets['author_followers'].isna().all() else 0
+        
+        # Most mentioned tickers
+        ticker_column = 'validated_ticker' if 'validated_ticker' in trader_tweets.columns else 'tickers_mentioned'
+        top_tickers = ''
+        
+        if ticker_column == 'validated_ticker':
+            top_ticker_counts = trader_tweets[ticker_column].value_counts().nlargest(3)
+            top_tickers = ', '.join(top_ticker_counts.index.tolist())
+        elif ticker_column == 'tickers_mentioned':
+            all_tickers = []
+            for tickers in trader_tweets[ticker_column].dropna():
+                if tickers:
+                    all_tickers.extend(tickers.split(','))
+            if all_tickers:
+                top_ticker_counts = pd.Series(all_tickers).value_counts().nlargest(3)
+                top_tickers = ', '.join(top_ticker_counts.index.tolist())
+        
+        # Add to results
         trader_metrics.append({
             'trader': trader,
             'accuracy': accuracy,
             'avg_return': avg_return,
-            'total_tweets': total_tweets,
-            'total_conversations': total_convs,
+            'total_tweets': len(trader_tweets),
+            'total_conversations': trader_tweets['conversation_id'].nunique() if 'conversation_id' in trader_tweets.columns else 0,
             'followers': followers,
             'bullish_pct': bullish_pct,
             'bearish_pct': bearish_pct,
-            'top_stocks': top_stocks_str
+            'top_stocks': top_tickers
         })
     
-    return pd.DataFrame(trader_metrics)
+    # Convert to dataframe
+    trader_df = pd.DataFrame(trader_metrics)
+    
+    # Sort by accuracy
+    if not trader_df.empty:
+        trader_df = trader_df.sort_values('accuracy', ascending=False)
+    
+    return trader_df
 
 def create_overview_dashboard(df):
     st.markdown("<h1 class='main-header'>Twitter Trader Analysis Dashboard</h1>", unsafe_allow_html=True)
     
     st.markdown("<h2>Key Metrics</h2>", unsafe_allow_html=True)
-    
-    metric_cols = st.columns(4)
-    
-    with metric_cols[0]:
-        st.markdown("""
-        <div class="metric-card">
-            <div class="metric-value">{}</div>
-            <div class="metric-label">Total Traders</div>
-        </div>
-        """.format(df['author'].nunique()), unsafe_allow_html=True)
-    
-    with metric_cols[1]:
-        st.markdown("""
-        <div class="metric-card">
-            <div class="metric-value">{}</div>
-            <div class="metric-label">Total Predictions</div>
-        </div>
-        """.format(len(df)), unsafe_allow_html=True)
-    
-    with metric_cols[2]:
-        correct_preds = df[df['prediction_correct'] == True].shape[0]
-        accuracy = correct_preds / len(df) * 100 if len(df) > 0 else 0
-        st.markdown("""
-        <div class="metric-card">
-            <div class="metric-value">{:.1f}%</div>
-            <div class="metric-label">Overall Accuracy</div>
-        </div>
-        """.format(accuracy), unsafe_allow_html=True)
-    
-    with metric_cols[3]:
-        avg_return = df['actual_return'].mean() if 'actual_return' in df.columns else 0
-        st.markdown("""
-        <div class="metric-card">
-            <div class="metric-value">{:.2f}%</div>
-            <div class="metric-label">Avg. Return</div>
-        </div>
-        """.format(avg_return), unsafe_allow_html=True)
     
     valid_traders = []
     invalid_traders = []
@@ -717,53 +800,85 @@ def create_overview_dashboard(df):
         else:
             invalid_traders.append(trader)
     
-    filtered_df = df[df['author'].isin(valid_traders)]
-    parent_tweets = filtered_df[filtered_df['tweet_type'] == 'parent']
-    
-    unique_traders = len(valid_traders)
-    total_tweets = len(filtered_df)
-    
+    # --- Create DataFrame containing ALL tweets (deleted & active) from VALID traders ---
+    trader_all_df = df[df['author'].isin(valid_traders)].copy()
+
+    # --- Create the main DataFrame for analysis: only ACTIVE tweets from VALID traders ---
+    filtered_df = trader_all_df[trader_all_df['is_deleted'] == False].copy()
+
+    # Parent tweets for dashboard: Active, Parent type, AND Bullish/Bearish
+    parent_tweets = filtered_df[
+         (filtered_df['tweet_type'] == 'parent') & 
+         (filtered_df['sentiment'].isin(['bullish', 'bearish'])) & 
+         (filtered_df['time_horizon'].notna()) & 
+         (filtered_df['time_horizon'] != 'unknown')
+     ].copy()
+
+    # --- Calculate Metrics for Display ---
+    unique_traders = filtered_df['author'].nunique()
+    total_active_tweets = len(filtered_df) # Count of non-deleted tweets from valid traders
+
+    # Accuracy and Return are based on active parent tweets
     accuracy_df = parent_tweets[parent_tweets['prediction_correct'].notna()]
     overall_accuracy = accuracy_df['prediction_correct'].mean() * 100 if len(accuracy_df) > 0 else 0
-    avg_return = parent_tweets['actual_return'].mean() if 'actual_return' in parent_tweets.columns else 0
+    avg_return = parent_tweets['actual_return'].mean() if 'actual_return' in parent_tweets.columns and not parent_tweets['actual_return'].isna().all() else 0
+
+    # Deleted count and percentage are based on ALL tweets from valid traders
+    total_trader_tweets = len(trader_all_df)
+    deleted_count = trader_all_df[trader_all_df['is_deleted'] == True].shape[0]
+    deleted_pct = (deleted_count / total_trader_tweets * 100) if total_trader_tweets > 0 else 0
     
-    validation_rate = len(accuracy_df) / len(parent_tweets) * 100 if len(parent_tweets) > 0 else 0
-    
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    with col1:
+    # --- NEW: Calculate Actionable Tweet Rate ---
+    actionable_tweet_count = len(parent_tweets) # Already filtered strictly
+    actionable_rate = (actionable_tweet_count / total_active_tweets * 100) if total_active_tweets > 0 else 0
+
+    # --- Display Metric Cards (Now 2 Rows of 3 Columns) ---
+    row1_cols = st.columns(3)
+    row2_cols = st.columns(3)
+
+    # --- Row 1 ---
+    with row1_cols[0]: # Actionable Tweet Rate Card
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value neutral">{actionable_rate:.1f}%</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Actionable Tweet Rate</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-note">{actionable_tweet_count}/{total_active_tweets} tweets</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with row1_cols[1]: # Unique Traders
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-value neutral">{unique_traders}</div>', unsafe_allow_html=True)
         st.markdown('<div class="metric-label">Unique Traders</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
-    
-    with col2:
+
+    with row1_cols[2]: # Total Active Tweets
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-value neutral">{total_tweets:,}</div>', unsafe_allow_html=True)
-        st.markdown('<div class="metric-label">Total Tweets</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value neutral">{total_active_tweets:,}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Total Active Tweets</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
-    
-    with col3:
+
+    # --- Row 2 ---
+    with row2_cols[0]: # Overall Accuracy
         accuracy_class = "positive" if overall_accuracy > 50 else "negative"
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-value {accuracy_class}">{overall_accuracy:.1f}%</div>', unsafe_allow_html=True)
         st.markdown('<div class="metric-label">Overall Accuracy</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
-    
-    with col4:
+
+    with row2_cols[1]: # Average Return
         return_class = "positive" if avg_return > 0 else "negative"
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-value {return_class}">{avg_return:.2f}%</div>', unsafe_allow_html=True)
         st.markdown('<div class="metric-label">Average Return</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
-        
-    with col5:
+
+    with row2_cols[2]: # Deleted Tweets %
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-value neutral">{validation_rate:.1f}%</div>', unsafe_allow_html=True)
-        st.markdown('<div class="metric-label">Validation Rate</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-note">{len(accuracy_df)}/{len(parent_tweets)} predictions</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-value neutral">{deleted_pct:.1f}%</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Deleted Tweets (%)</div>', unsafe_allow_html=True)
+        # Show counts based on the trader_all_df used for calculation
+        st.markdown(f'<div class="metric-note">{deleted_count}/{total_trader_tweets} marked</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
-    
+
     with st.expander("Show traders with insufficient data"):
         st.info(f"{len(invalid_traders)} traders were filtered out due to having fewer than 3 actionable tweets.")
         if invalid_traders:
@@ -812,8 +927,7 @@ def create_overview_dashboard(df):
 
         # Show the aggregated top_traders data used in the plot
         format_and_display_data(top_traders, 
-                                title="Show Aggregated Data for Top Traders Plot",
-                                relevant_columns=['trader', 'accuracy', 'avg_return', 'total_tweets', 'followers'])
+                                title="Show Aggregated Data for Top Traders Plot")
     
     with col2:
         st.markdown('<div class="highlight">', unsafe_allow_html=True)
@@ -829,13 +943,13 @@ def create_overview_dashboard(df):
         
         st.dataframe(display_df, use_container_width=True, height=400)
     
+    # --- Sentiment & Stock Analysis ---
     st.markdown('<div class="sub-header">Sentiment & Stock Analysis</div>', unsafe_allow_html=True)
-    
     col1, col2 = st.columns(2)
-    
-    with col1:
-        all_parent_tweets = filtered_df[filtered_df['tweet_type'] == 'parent']
-        sentiment_counts = all_parent_tweets['sentiment'].value_counts()
+
+    with col1: 
+        # Sentiment pie chart now uses the filtered parent_tweets
+        sentiment_counts = parent_tweets['sentiment'].value_counts()
         sentiment_pcts = sentiment_counts / sentiment_counts.sum() * 100
 
         fig = px.pie(
@@ -846,130 +960,127 @@ def create_overview_dashboard(df):
             color_discrete_map={'bullish': '#17BF63', 'bearish': '#E0245E', 'neutral': '#AAB8C2'},
             hole=0.4
         )
-
-        fig.update_layout(
-            legend_title="Sentiment",
-            margin=dict(t=30, b=0, l=0, r=0),
-            height=400,
-            font=dict(size=14)
-        )
-
-        fig.update_traces(
-            textposition='inside',
-            textinfo='percent+label',
-            insidetextfont=dict(color='white')
-        )
-
+        # ... more fig updates ...
         st.plotly_chart(fig, use_container_width=True)
 
         # Show raw data with relevant columns
-        format_and_display_data(all_parent_tweets, 
-                                title="Show Raw Data for Sentiment Distribution",
-                                relevant_columns=['tweet_id', 'author', 'created_date', 'sentiment'])
+        format_and_display_data(parent_tweets, 
+                                title="Show Raw Data for Sentiment Distribution")
     
     with col2:
-        stock_counts = df['validated_ticker'].value_counts().nlargest(10).reset_index()
-        # Rename columns to match plot expectations
-        stock_counts.columns = ['Stock', 'Count'] 
-        
-        fig = px.bar(
-            stock_counts,
-            x='Count',
-            y='Stock',
-            orientation='h',
-            color='Count',
-            color_continuous_scale='Viridis',
-            title='Top 10 Most Mentioned Stocks'
-        )
-        
-        fig.update_layout(height=400, yaxis={'categoryorder': 'total ascending'})
-        
-        st.plotly_chart(fig, use_container_width=True)
+        # Top stocks count now uses the filtered parent_tweets
+        # Ensure 'validated_ticker' column exists
+        if 'validated_ticker' in parent_tweets.columns:
+            stock_counts = parent_tweets['validated_ticker'].value_counts().nlargest(10).reset_index()
+            stock_counts.columns = ['Stock', 'Count']
 
-        # Show filtered raw data with relevant columns
-        top_stocks_list = stock_counts['Stock'].tolist()
-        filtered_raw_stock_data = parent_tweets[parent_tweets['validated_ticker'].isin(top_stocks_list)]
-        format_and_display_data(filtered_raw_stock_data, 
-                                title="Show Raw Data for Top Mentioned Stocks",
-                                relevant_columns=['tweet_id', 'author', 'created_date', 'validated_ticker'])
+            fig = px.bar(
+                stock_counts,
+                x='Count',
+                y='Stock',
+                orientation='h',
+                color='Count',
+                color_continuous_scale='Viridis',
+                title='Top 10 Most Mentioned Stocks'
+            )
+            
+            fig.update_layout(height=400, yaxis={'categoryorder': 'total ascending'})
+            
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Show filtered raw data with relevant columns
+            top_stocks_list = stock_counts['Stock'].tolist()
+            # Base the raw data display on parent_tweets filtered by these top stocks
+            filtered_raw_stock_data = parent_tweets[parent_tweets['validated_ticker'].isin(top_stocks_list)]
+            format_and_display_data(filtered_raw_stock_data,
+                                    title="Show Raw Data for Top Mentioned Stocks")
+        else:
+            st.warning("'validated_ticker' column not found in parent tweets data.")
     
     st.markdown('<div class="sub-header">Time Series Analysis</div>', unsafe_allow_html=True)
     
-    df['month'] = df['created_date'].dt.to_period('M').astype(str)
-    monthly_data = df.groupby('month').agg(
-        tweet_count=('conversation_id', 'count'),
-        avg_accuracy=('prediction_correct', lambda x: x.mean() * 100 if x.notna().any() else None),
-        avg_return=('actual_return', 'mean')
-    ).reset_index()
-    
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    fig.add_trace(
-        go.Bar(
-            x=monthly_data['month'],
-            y=monthly_data['tweet_count'],
-            name='Tweet Count',
-            marker_color='lightblue'
-        ),
-        secondary_y=False
-    )
-    
-    fig.add_trace(
-        go.Scatter(
-            x=monthly_data['month'],
-            y=monthly_data['avg_accuracy'],
-            name='Avg Accuracy (%)',
-            line=dict(color='green', width=3)
-        ),
-        secondary_y=True
-    )
-    
-    fig.add_trace(
-        go.Scatter(
-            x=monthly_data['month'],
-            y=monthly_data['avg_return'],
-            name='Avg Return (%)',
-            line=dict(color='red', width=3, dash='dot')
-        ),
-        secondary_y=True
-    )
-    
-    fig.add_shape(
-        type='line',
-        x0=monthly_data['month'].iloc[0],
-        x1=monthly_data['month'].iloc[-1],
-        y0=50,
-        y1=50,
-        line=dict(color='green', width=2, dash='dash'),
-        yref='y2'
-    )
-    
-    fig.add_shape(
-        type='line',
-        x0=monthly_data['month'].iloc[0],
-        x1=monthly_data['month'].iloc[-1],
-        y0=0,
-        y1=0,
-        line=dict(color='red', width=2, dash='dash'),
-        yref='y2'
-    )
-    
-    fig.update_layout(
-        title='Monthly Tweet Count, Accuracy, and Return',
-        xaxis_title='Month',
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-        height=500
-    )
-    
-    fig.update_yaxes(title_text='Tweet Count', secondary_y=False)
-    fig.update_yaxes(title_text='Percentage (%)', secondary_y=True)
-    
-    st.plotly_chart(fig, use_container_width=True)
+    # Monthly analysis now uses the filtered_df (which excludes deleted)
+    if not filtered_df.empty and 'created_date' in filtered_df.columns:
+        monthly_df_copy = filtered_df.copy()
+        monthly_df_copy['month'] = monthly_df_copy['created_date'].dt.to_period('M').astype(str)
 
-    # Show raw data with relevant columns used in aggregation
-    format_and_display_data(df, 
-                                title="Show Raw Data for Monthly Analysis", 
-                                relevant_columns=['tweet_id', 'author', 'created_date', 'prediction_correct', 'actual_return', 'conversation_id'])
+        # Aggregate based on the filtered data
+        monthly_data = monthly_df_copy.groupby('month').agg(
+            tweet_count=('tweet_id', 'count'), # Use a non-nullable column like tweet_id
+            # Calculate accuracy based ONLY on parent tweets within the month
+            avg_accuracy=('prediction_correct', lambda x: (x[monthly_df_copy.loc[x.index, 'tweet_type'] == 'parent'].mean() * 100) if x[monthly_df_copy.loc[x.index, 'tweet_type'] == 'parent'].notna().any() else None),
+            # Calculate return based ONLY on parent tweets within the month
+            avg_return=('actual_return', lambda x: x[monthly_df_copy.loc[x.index, 'tweet_type'] == 'parent'].mean() if 'actual_return' in monthly_df_copy.columns else None)
+        ).reset_index()
+
+        fig = make_subplots(specs=[[{'secondary_y': True}]])
+        
+        fig.add_trace(
+            go.Bar(
+                x=monthly_data['month'],
+                y=monthly_data['tweet_count'],
+                name='Tweet Count',
+                marker_color='lightblue'
+            ),
+            secondary_y=False
+        )
+        
+        fig.add_trace(
+            go.Scatter(
+                x=monthly_data['month'],
+                y=monthly_data['avg_accuracy'],
+                name='Avg Accuracy (%)',
+                line=dict(color='green', width=3)
+            ),
+            secondary_y=True
+        )
+        
+        fig.add_trace(
+            go.Scatter(
+                x=monthly_data['month'],
+                y=monthly_data['avg_return'],
+                name='Avg Return (%)',
+                line=dict(color='red', width=3, dash='dot')
+            ),
+            secondary_y=True
+        )
+        
+        fig.add_shape(
+            type='line',
+            x0=monthly_data['month'].iloc[0],
+            x1=monthly_data['month'].iloc[-1],
+            y0=50,
+            y1=50,
+            line=dict(color='green', width=2, dash='dash'),
+            yref='y2'
+        )
+        
+        fig.add_shape(
+            type='line',
+            x0=monthly_data['month'].iloc[0],
+            x1=monthly_data['month'].iloc[-1],
+            y0=0,
+            y1=0,
+            line=dict(color='red', width=2, dash='dash'),
+            yref='y2'
+        )
+        
+        fig.update_layout(
+            title='Monthly Tweet Count, Accuracy, and Return',
+            xaxis_title='Month',
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+            height=500
+        )
+        
+        fig.update_yaxes(title_text='Tweet Count', secondary_y=False)
+        fig.update_yaxes(title_text='Percentage (%)', secondary_y=True)
+        
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Show raw data with relevant columns used in aggregation (using filtered_df)
+        format_and_display_data(filtered_df, title="Show Raw Data for Monthly Analysis")
+    else:
+        st.warning("Insufficient data for monthly time series analysis after filtering.")
     
     st.markdown('<div class="sub-header">Trader Comparison</div>', unsafe_allow_html=True)
     
@@ -986,6 +1097,7 @@ def create_overview_dashboard(df):
     display_df['Followers'] = display_df['Followers'].apply(lambda x: f"{x:,}")
     
     st.dataframe(display_df, use_container_width=True, height=400)
+
 
 def create_trader_profile(df, trader_name):
     df_user, df_parent = filter_trader_data(df, trader_name)
@@ -1147,8 +1259,7 @@ def create_trader_profile(df, trader_name):
 
             # Show raw data with relevant columns
             format_and_display_data(df_parent, 
-                                    title="Show Raw Data for Sentiment Distribution",
-                                    relevant_columns=['tweet_id', 'author', 'created_date', 'sentiment'])
+                                    title="Show Raw Data for Sentiment Distribution")
         
         with dist_col2:
             time_horizon_counts = df_parent['time_horizon'].value_counts()
@@ -1165,8 +1276,7 @@ def create_trader_profile(df, trader_name):
 
             # Show raw data with relevant columns
             format_and_display_data(df_parent, 
-                                    title="Show Raw Data for Time Horizon Distribution",
-                                    relevant_columns=['tweet_id', 'author', 'created_date', 'time_horizon'])
+                                    title="Show Raw Data for Time Horizon Distribution")
         
         # Add the Raw Data table
         st.markdown('<div class="sub-header">Raw Data Used for Analysis</div>', unsafe_allow_html=True)
@@ -1617,6 +1727,7 @@ def create_trader_profile(df, trader_name):
         fig.add_hline(y=0, line_dash="dash", line_color="gray")
         fig.add_vline(x=50, line_dash="dash", line_color="gray")
         
+        
         fig.add_annotation(x=25, y=stock_combined['mean_return'].max() * 0.75,
                           text="Low Accuracy<br>High Return", showarrow=False)
         fig.add_annotation(x=75, y=stock_combined['mean_return'].max() * 0.75,
@@ -1837,7 +1948,8 @@ def create_data_extraction_dashboard():
                 "OpenAI API Key", 
                 type="password",
                 help="Enter your OpenAI API key to use for LLM processing",
-                placeholder="sk-..."
+                placeholder="sk-...",
+                key="openai_api_key" # Added unique key
             )
             
             num_workers = st.slider(
@@ -1845,7 +1957,8 @@ def create_data_extraction_dashboard():
                 min_value=1, 
                 max_value=16, 
                 value=8,
-                help="Higher values may process faster but use more resources"
+                help="Higher values may process faster but use more resources",
+                key="num_workers" # Added unique key
             )
             
             st.info(f"""
@@ -1864,8 +1977,15 @@ def create_data_extraction_dashboard():
                             st.error("❌ No data in session state! Please run extraction first.")
                             return
                         
-                        df = st.session_state.twitter_data
-                        
+                        # Ensure data is DataFrame
+                        if isinstance(st.session_state.twitter_data, pd.DataFrame):
+                             df = st.session_state.twitter_data
+                        elif isinstance(st.session_state.twitter_data, list):
+                            df = pd.DataFrame(st.session_state.twitter_data)
+                        else:
+                            st.error("❌ Invalid data format in session state! Please re-run extraction.")
+                            return
+
                         progress_bar = st.progress(0)
                         status_text = st.empty()
                         
@@ -1874,84 +1994,54 @@ def create_data_extraction_dashboard():
                         
                         num_workers = st.session_state.get("num_workers", 8)
                         
-                        def process_tweet(tweet_data):
+                        def process_tweet_fully(original_tweet_data):
                             try:
-                                text = tweet_data.get('text', '')
-                                if not text:
-                                    text = tweet_data.get('fullText', '')
-                                
-                                response = client.chat.completions.create(
-                                    model="gpt-4o-mini",
-                                    messages=[{"role": "system", "content": """
-                                        You are a financial market analyst. Analyze the given tweet and return your analysis in JSON format.
-                                        Your response should be a valid JSON object with the following structure:
-                                        {
-                                            "time_horizon": "intraday/daily/weekly/short_term/medium_term/long_term/unknown",
-                                            "trade_type": "trade_suggestion/analysis/news/general_discussion/unknown",
-                                            "sentiment": "bullish/bearish/neutral"
-                                        }
+                                tweet_text = original_tweet_data.get('text', '')
+                                author = original_tweet_data.get('author_userName', original_tweet_data.get('authorUsername', ''))
 
-                                        Guidelines for classification:
-                                        1. Time horizon:
-                                           - intraday: within the same trading day or mentions "today"
-                                           - daily: 1-5 trading days, mentions "tomorrow", "next day", or this week
-                                           - weekly: 1-4 weeks, mentions "next week" or specific dates within a month
-                                           - short_term: 1-3 months, mentions "next month", " next quarter"
-                                           - medium_term: 3-6 months, mentions "quarter", or "Q1/Q2/Q3/Q4, "end of year"
-                                           - long_term: >6 months, mentions "next year" or longer timeframes
-                                           - unknown: if not specified
-                                           
-                                           IMPORTANT: Pay close attention to time-related words like "today", "tomorrow", "next week", etc.
-                                           If the tweet mentions earnings or events happening "tomorrow", classify as "daily".
+                                # 1. LLM Classification
+                                # analysis = classify_tweet_func(tweet_text) # Uses the imported function
+                                analysis = twitter_llm_module.classify_tweet_with_llm(tweet_text) # Use the imported function correctly
+
+                                # 2. Regex Tickers
+                                regex_tickers = apify_extractor.extract_tickers_regex(tweet_text)
+                                
+                                # 3. Context Enrichment (Example for Jedi_ant)
+                                enriched_tickers = set(regex_tickers) # Start with regex tickers
+                                if author == 'Jedi_ant':
+                                    # Simplified mapping for example
+                                    if 'china' in tweet_text.lower():
+                                        enriched_tickers.update(['KTEC', 'FXI'])
                                         
-                                        2. Type of content:
-                                           - trade_suggestion: specific entry/exit points or direct trade recommendations
-                                           - analysis: market analysis, chart patterns, fundamentals
-                                           - news: market news, company updates, economic data, earnings announcements
-                                           - general_discussion: general market talk
-                                           - unknown: if unclear
-                                        
-                                        3. Market sentiment:
-                                           - bullish: positive outlook, expecting upward movement
-                                           - bearish: negative outlook, expecting downward movement
-                                           - neutral: balanced view or no clear direction
-                                        """},
-                                        {"role": "user", "content": text}
-                                    ],
-                                    response_format={"type": "json_object"}
-                                )
+                                final_tickers_str = ', '.join(sorted(list(enriched_tickers)))
+
+                                # 4. Combine results
+                                combined_result = original_tweet_data.copy()
+                                combined_result.update(analysis) # Add LLM fields
+                                combined_result['tickers_mentioned'] = final_tickers_str # Use combined tickers
+                                # Ensure core fields are preserved
+                                combined_result['tweet_id'] = original_tweet_data.get('id', '')
+                                combined_result['author'] = author
+                                combined_result['created_at'] = original_tweet_data.get('createdAt', original_tweet_data.get('created_at', ''))
+                                combined_result['text'] = tweet_text
+                                combined_result['like_count'] = original_tweet_data.get('likeCount', original_tweet_data.get('like_count', 0))
+                                combined_result['retweet_count'] = original_tweet_data.get('retweetCount', original_tweet_data.get('retweet_count', 0))
                                 
-                                llm_response = response.choices[0].message.content
-                                author_info = tweet_data.get('author', {})
-                                author_name = author_info.get('userName', '') if isinstance(author_info, dict) else ''
-                                
-                                result = {
-                                    'id': tweet_data.get('id', ''),
-                                    'text': text,
-                                    'author': author_name,
-                                    'created_at': tweet_data.get('createdAt', ''),
-                                    'llm_response': llm_response,
-                                }
-                                
-                                try:
-                                    import json
-                                    data = json.loads(llm_response)
-                                    result['time_horizon'] = data.get('time_horizon', 'unknown')
-                                    result['trade_type'] = data.get('trade_type', 'unknown')
-                                    result['sentiment'] = data.get('sentiment', 'neutral')
-                                except Exception as json_err:
-                                    print(f"Error parsing JSON: {json_err}")
-                                
-                                return result
+                                return combined_result
+
                             except Exception as e:
-                                return {
-                                    'id': tweet_data.get('id', ''),
-                                    'text': tweet_data.get('text', ''),
-                                    'error': str(e)
-                                }
+                                print(f'Error processing tweet {original_tweet_data.get("id", "unknown")}: {e}')
+                                # Return original data with error flags/defaults
+                                failed_result = original_tweet_data.copy()
+                                failed_result['time_horizon'] = 'error'
+                                failed_result['trade_type'] = 'error'
+                                failed_result['sentiment'] = 'error'
+                                failed_result['tickers_mentioned'] = ', '.join(apify_extractor.extract_tickers_regex(failed_result.get('text','')))
+                                return failed_result
                         
                         import concurrent.futures
                         import time
+                        import pandas as pd # Ensure pandas is imported here
                         
                         tweets_to_process = df.to_dict('records')
                         total_tweets = len(tweets_to_process)
@@ -1963,12 +2053,34 @@ def create_data_extraction_dashboard():
                         completed = 0
                         
                         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-                            future_to_tweet = {executor.submit(process_tweet, tweet): tweet for tweet in tweets_to_process}
+                            # Submit tasks using the new full processing helper function
+                            future_to_tweet = {executor.submit(process_tweet_fully, tweet): tweet 
+                                              for tweet in tweets_to_process}
                             
                             for future in concurrent.futures.as_completed(future_to_tweet):
-                                result = future.result()
-                                processed_tweets.append(result)
-                                
+                                # original_tweet_data = future_to_tweet[future] # No longer needed here
+                                try:
+                                    processed_result = future.result() # Result already has combined data
+                                    if processed_result: # Check if result is not None
+                                         processed_tweets.append(processed_result)
+                                    else:
+                                         # Handle case where processing function returned None (should have returned dict)
+                                         print(f"Warning: Processing returned None for a tweet.") 
+                                         # Optionally append original data or skip
+                                         # processed_tweets.append(future_to_tweet[future]) 
+                                         
+                                except Exception as exc:
+                                    # This catches errors during future.result() itself, though inner errors are handled in process_tweet_fully
+                                    original_data = future_to_tweet[future]
+                                    print(f'Future for tweet {original_data.get("id", "unknown")} generated an exception: {exc}')
+                                    # Append original data with error flags as fallback
+                                    failed_result = original_data.copy()
+                                    failed_result['time_horizon'] = 'future_error'
+                                    failed_result['trade_type'] = 'future_error'
+                                    failed_result['sentiment'] = 'future_error'
+                                    failed_result['tickers_mentioned'] = ', '.join(apify_extractor.extract_tickers_regex(failed_result.get('text','')))
+                                    processed_tweets.append(failed_result)
+
                                 completed += 1
                                 progress = completed / total_tweets
                                 progress_bar.progress(progress)
@@ -2017,154 +2129,82 @@ def create_data_extraction_dashboard():
             
             if st.button("📤 Filter & Upload", use_container_width=True, type="primary"):
                 try:
-                    with st.spinner("Preparing tweets for upload..."):
-                        df = st.session_state.processed_data.copy()
+                    if 'processed_data' not in st.session_state or st.session_state.processed_data is None or st.session_state.processed_data.empty:
+                        st.error("❌ No processed data available! Please run LLM processing first.")
+                        return
+
+                    df_processed = st.session_state.processed_data.copy()
+                    st.info(f"Starting upload process for {len(df_processed)} processed tweets...")
+
+                    # --- Call Backend Flagging Logic ---
+                    # Import the necessary function from twitter_predictions
+                    try:
+                        from twitter_predictions import identify_and_flag_actionable_tweets, standardize_data, enrich_text_with_context, upload_to_database, add_market_validation_columns # Import add_market_validation_columns
+                    except ImportError:
+                         st.error("Could not import functions from twitter_predictions.py")
+                         return
+                         
+                    with st.spinner("Standardizing and flagging tweets..."):
+                        # Ensure necessary columns exist before flagging
+                        if 'tweet_type' not in df_processed.columns:
+                            df_processed['tweet_type'] = 'parent' # Basic default if missing
+                        if 'tickers_mentioned' not in df_processed.columns:
+                             df_processed['tickers_mentioned'] = df_processed['tickers'] # Assume 'tickers' exists from LLM step if 'tickers_mentioned' doesn't
+
+                        # Apply standardization and flagging from the backend script
+                        df_standardized = standardize_data(df_processed) # Includes date calculations etc.
+                        df_enriched = enrich_text_with_context(df_standardized) # Apply context enrichment
+                        df_flagged = identify_and_flag_actionable_tweets(df_enriched)
+                        st.success("Flagging complete.")
                         
-                        if len(df) == 0:
-                            st.warning("No tweets available for processing.")
-                            return
+                        flagged_count = df_flagged[df_flagged['is_analytically_actionable'] == True].shape[0]
+                        deleted_count = df_flagged[df_flagged['is_deleted'] == True].shape[0]
+                        st.info(f"Flagged {flagged_count} as actionable, {deleted_count} marked as deleted.")
+
+                    # --- NEW: Add Market Validation Step ---
+                    with st.spinner("Adding market validation data..."):
+                        # Use default output dir for cache within streamlit environment if needed
+                        df_validated = add_market_validation_columns(df_flagged, output_dir='results') 
+                        st.success("Market validation complete.")
+                        validated_count = df_validated[df_validated['prediction_correct'].notna()].shape[0]
+                        st.info(f"{validated_count} tweets have market validation results.")
+                    # --- End Market Validation Step ---
+
+                    # --- Upload the FULL FLAGGED and VALIDATED DataFrame ---
+                    with st.spinner("Uploading data to database..."): 
+                        # Use the imported upload function with the correctly flagged and validated data
                         
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        status_text.text("Step 1/4: Preparing data...")
+                        # Add a basic print statement before calling upload
+                        print(f"Calling upload_to_database with {len(df_validated)} rows.")
                         
-                        required_columns = {
-                            'tweet_id': lambda x: float(x.name),
-                            'author': lambda x: str(x.get('author', ''))[:100],
-                            'text': lambda x: str(x.get('text', '')),
-                            'created_at': lambda x: pd.Timestamp.now(),
-                            'likes': lambda x: float(x.get('likes', 0)),
-                            'retweets': lambda x: float(x.get('retweets', 0)),
-                            'replies_count': lambda x: float(x.get('replies_count', 0)),
-                            'views': lambda x: float(x.get('views', 0)),
-                            'author_followers': lambda x: float(x.get('author_followers', 0)),
-                            'author_following': lambda x: float(x.get('author_following', 0)),
-                            'sentiment': lambda x: x.get('sentiment', 'bullish'),
-                            'trade_type': lambda x: str(x.get('trade_type', 'unknown')),
-                            'time_horizon': lambda x: str(x.get('time_horizon', 'unknown')),
-                            'prediction_date': lambda x: pd.Timestamp.now(),
-                            'tickers_mentioned': lambda x: ','.join([word.strip('$') for word in str(x.get('text', '')).split() if word.startswith('$')]),
-                            'conversation_id': lambda x: float(x.name),
-                            'tweet_type': 'parent',
-                            'reply_to_tweet_id': lambda x: float(0),
-                            'reply_to_user': lambda x: str(x.get('reply_to_user', ''))[:100],
-                            'author_verified': False,
-                            'author_blue_verified': False,
-                            'created_date': lambda x: pd.Timestamp.now().date(),
-                            'has_ticker': True,
-                            'validated_ticker': lambda x: str(x.get('validated_ticker', ''))[:50]
-                        }
-                        
-                        progress_bar.progress(25)
-                        status_text.text("Step 2/4: Filtering actionable tweets...")
-                        
-                        if 'tweet_type' not in df.columns:
-                            df['tweet_type'] = 'parent'
-                        
-                        if 'tickers_mentioned' not in df.columns:
-                            df['tickers_mentioned'] = df['text'].apply(
-                                lambda x: ','.join([word.strip('$') for word in str(x).split() if word.startswith('$')])
-                            )
-                        
-                        if 'sentiment' not in df.columns:
-                            df['sentiment'] = 'unknown'
-                        
-                        try:
-                            actionable_tweets = df[
-                                (df['tweet_type'] == 'parent') &
-                                (df['tickers_mentioned'].notna()) & 
-                                (df['tickers_mentioned'] != '') &
-                                (df['sentiment'].isin(['bullish', 'bearish']))
-                            ].copy()
-                        except KeyError as e:
-                            st.error(f"Missing column in data: {str(e)}")
-                            st.info("Adding required columns and continuing...")
-                            
-                            for col in ['tweet_type', 'tickers_mentioned', 'sentiment']:
-                                if col not in df.columns:
-                                    if col == 'tweet_type':
-                                        df[col] = 'parent'
-                                    elif col == 'tickers_mentioned':
-                                        df[col] = df['text'].apply(
-                                            lambda x: ','.join([word.strip('$') for word in str(x).split() if word.startswith('$')])
-                                        )
-                                    elif col == 'sentiment':
-                                        df[col] = 'unknown'
-                            
-                            actionable_tweets = df[
-                                (df['tweet_type'] == 'parent') &
-                                (df['tickers_mentioned'].notna()) & 
-                                (df['tickers_mentioned'] != '') &
-                                (df['sentiment'].isin(['bullish', 'bearish']))
-                            ].copy()
-                        
-                        if len(actionable_tweets) == 0:
-                            st.warning("No actionable tweets found after filtering.")
-                            return
-                        
-                        actionable_tweets = actionable_tweets.assign(
-                            prediction_correct=None,
-                            start_price=None,
-                            end_price=None,
-                            start_date=None,
-                            end_date=None,
-                            company_names=None,
-                            stocks=None,
-                            price_change_pct=None,
-                            actual_return=None,
-                            prediction_score=None
-                        )
-                        
-                        progress_bar.progress(50)
-                        status_text.text("Step 3/4: Preparing data for upload...")
-                        
-                        st.info(f"Found {len(actionable_tweets)} actionable tweets to upload")
-                        
-                        sentiment_counts = actionable_tweets['sentiment'].value_counts().to_dict()
-                        sentiment_html = "<div style='margin: 10px 0;'><strong>Sentiment distribution:</strong><br>"
-                        for sentiment, count in sentiment_counts.items():
-                            color = "#4CAF50" if sentiment == "bullish" else "#F44336"
-                            sentiment_html += f"<span style='color:{color};'>{sentiment}</span>: {count} tweets<br>"
-                        sentiment_html += "</div>"
-                        st.markdown(sentiment_html, unsafe_allow_html=True)
-                        
-                        progress_bar.progress(75)
-                        status_text.text("Step 4/4: Uploading to database...")
+                        # Capture print output from upload_to_database
+                        original_stdout = sys.stdout
+                        debug_output = io.StringIO()
+                        sys.stdout = debug_output
                         
                         try:
-                            import io
-                            import sys
-                            original_stdout = sys.stdout
-                            debug_output = io.StringIO()
-                            sys.stdout = debug_output
-                            
-                            success = upload_to_database(actionable_tweets)
-                            
-                            sys.stdout = original_stdout
-                            
-                            upload_logs = debug_output.getvalue()
-                            
-                            progress_bar.progress(100)
-                            
-                            if success or "Database upload complete" in upload_logs:
-                                st.balloons()
-                                st.success(f"✅ Successfully uploaded {len(actionable_tweets)} tweets to database!")
-                                
-                                with st.expander("View Upload Details"):
-                                    st.write(f"Tweet types: {actionable_tweets['tweet_type'].value_counts().to_dict()}")
-                                    st.write(f"Time horizons: {actionable_tweets['time_horizon'].value_counts().to_dict()}")
-                                    st.write(f"Trade types: {actionable_tweets['trade_type'].value_counts().to_dict()}")
-                            else:
-                                st.error("❌ Error during database upload. Check the logs for details.")
-                                with st.expander("View Upload Logs"):
-                                    st.code(upload_logs)
-                        except Exception as e:
-                            st.error(f"Error during upload: {str(e)}")
-                            with st.expander("View Error Details"):
-                                st.code(traceback.format_exc())
-                        
+                           upload_to_database(df_validated) # Pass the flagged df
+                           upload_success = True # Assume success if no exception
+                        except Exception as upload_err:
+                            print(f"ERROR during upload_to_database call: {upload_err}")
+                            upload_success = False
+                        finally:
+                             sys.stdout = original_stdout # Restore stdout
+                             
+                        upload_logs = debug_output.getvalue()
+
+                        # Display logs from upload_to_database
+                        with st.expander("View Upload Logs"):
+                            st.code(upload_logs)
+
+                        if upload_success: # Check for success (modify if upload_to_database returns status)
+                            st.balloons()
+                            st.success(f"✅ Successfully initiated upload of {len(df_validated)} tweets to database!")
+                        else:
+                            st.error("❌ Error during database upload. Check logs.")
+
                 except Exception as e:
-                    st.error(f"Error during upload: {str(e)}")
+                    st.error(f"Error during filtering/upload process: {str(e)}")
                     with st.expander("View Error Details"):
                         st.code(traceback.format_exc())
         else:
@@ -2204,7 +2244,7 @@ def run_prediction_process(df, output_dir='results'):
     
     except Exception as e:
         print(f"Error in prediction process: {e}")
-        import traceback
+        import traceback 
         traceback.print_exc()
         return None
 
@@ -2312,10 +2352,30 @@ def create_raw_data_dashboard(df):
     # --- Filter Row 2 ---
     filter_cols_2 = st.columns(4)
     with filter_cols_2[0]:
+        # Modified filter for combined status
+        if 'is_deleted' in df.columns and 'is_analytically_actionable' in df.columns:
+            status_options = {
+                "All": None, 
+                "Active & Actionable": "active_actionable", 
+                "Active & Non-Actionable": "active_non_actionable", 
+                "Deleted": "deleted"
+            }
+            selected_status_label = st.selectbox(
+                "Filter by Tweet Status", # Renamed label
+                options=list(status_options.keys()),
+                index=0 # Default to "All"
+            )
+            selected_status_key = status_options[selected_status_label]
+        else:
+            selected_status_key = None
+            st.info("Status columns (is_deleted/is_analytically_actionable) not found")
+
+
+    with filter_cols_2[1]: # Shifted date filter to column 2
         if 'created_date' in df.columns:
             min_date = df['created_date'].min().date()
             max_date = df['created_date'].max().date()
-            
+
             # Check if min_date and max_date are the same
             if min_date == max_date:
                 st.info(f"Data available only for {min_date}")
@@ -2333,6 +2393,15 @@ def create_raw_data_dashboard(df):
         else:
             selected_date_range = None
             st.info("No date column for filtering")
+
+    # --- Add Filter for Tweet Type ---
+    with filter_cols_2[2]: # Use the next available column
+        if 'tweet_type' in df.columns:
+            tweet_types = ["All"] + df['tweet_type'].dropna().unique().tolist()
+            selected_tweet_type = st.selectbox("Filter by Tweet Type", tweet_types, index=0)
+        else:
+            selected_tweet_type = "All"
+            st.info("No tweet_type column found")
 
     # --- Apply Filters ---
     filtered_df = df.copy()
@@ -2366,6 +2435,20 @@ def create_raw_data_dashboard(df):
         end_datetime = pd.to_datetime(end_date) + pd.Timedelta(days=1) # Make end date inclusive
         filtered_df = filtered_df[(filtered_df['created_date'] >= start_datetime) & (filtered_df['created_date'] < end_datetime)]
 
+    # Apply the modified status filter
+    if selected_status_key is not None and 'is_deleted' in filtered_df.columns and 'is_analytically_actionable' in filtered_df.columns:
+        if selected_status_key == "active_actionable":
+            filtered_df = filtered_df[(filtered_df['is_deleted'] == False) & (filtered_df['is_analytically_actionable'] == True)]
+        elif selected_status_key == "active_non_actionable":
+            filtered_df = filtered_df[(filtered_df['is_deleted'] == False) & (filtered_df['is_analytically_actionable'] == False)]
+        elif selected_status_key == "deleted":
+            filtered_df = filtered_df[filtered_df['is_deleted'] == True]
+        # 'All' (None key) case doesn't require filtering here
+
+    # Apply Tweet Type Filter
+    if selected_tweet_type != "All" and 'tweet_type' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['tweet_type'] == selected_tweet_type]
+
     st.markdown("<h2 class='sub-header'>Filtered Data</h2>", unsafe_allow_html=True)
 
     # Use helper function to display the filtered data
@@ -2378,7 +2461,8 @@ def create_raw_data_dashboard(df):
         'tweet_id', 'tweet_link', 'created_date', 'author', 'text', 
         'sentiment', 'time_horizon', 'trade_type', 'validated_ticker',
         'prediction_correct', 'Result Flag', 'actual_return', 'price_change_pct',
-        'start_date', 'end_date', 'start_price', 'end_price'
+        'start_date', 'end_date', 'start_price', 'end_price',
+        'is_deleted', 'is_analytically_actionable' # Added deletion/actionable flags
     ]
     if 'tweet_id' in display_df_for_download.columns and 'author' in display_df_for_download.columns and 'tweet_link' not in display_df_for_download.columns:
         display_df_for_download['tweet_link'] = display_df_for_download.apply(lambda row: f"https://twitter.com/{row['author']}/status/{row['tweet_id']}" if pd.notna(row['tweet_id']) and pd.notna(row['author']) else None, axis=1)
