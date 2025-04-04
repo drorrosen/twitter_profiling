@@ -10,7 +10,6 @@ import os
 import time
 from datetime import timedelta
 import concurrent.futures
-import streamlit as st
 
 API_KEY = st.secrets["OPENAI_API_KEY"]
 # Set the API key
