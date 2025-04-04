@@ -908,10 +908,24 @@ def add_market_validation_columns(df, all_tweets=None, output_dir='results', max
     parent_count = 0
     
     # Only validate parent tweets - replies are for context only
-    parent_tweets = df[df['tweet_type'] == 'parent']
+    # --- MODIFICATION: Also filter out tweets already marked as deleted ---
+    parent_tweets = df[(df['tweet_type'] == 'parent') & (df['is_deleted'] == False)]
     parent_count = len(parent_tweets)
     
-    print(f"\nValidating {parent_count} parent tweets...")
+    if parent_count == 0:
+        print("No active parent tweets found to validate.")
+        # Ensure summary file is still created but shows zero counts if needed
+        summary_df = pd.DataFrame({
+            'Metric': ['Parent Tweets', 'Validated', 'Correct', 'Incorrect', 'Unknown'],
+            'Count': [0, 0, 0, 0, 0],
+            'Percentage': [100.0, 0, 0, 0, 0] 
+        })
+        if output_dir:
+             os.makedirs(output_dir, exist_ok=True)
+             summary_df.to_csv(f'{output_dir}/prediction_summary.csv', index=False)
+        return df # Return df as validation columns are already initialized
+
+    print(f"\nValidating {parent_count} active parent tweets...")
     
     # Process actionable parent tweets only
     for idx, row in parent_tweets.iterrows():
@@ -1284,12 +1298,21 @@ def upload_to_database(df):
         # Prepare the SQL query - with or without ON CONFLICT
         if use_on_conflict and conflict_columns:
             conflict_clause = ', '.join(conflict_columns)
+            # --- MODIFICATION: Use DO UPDATE SET --- 
+            update_columns = [col for col in valid_columns if col not in conflict_columns]
+            if not update_columns: # Should not happen if tweet_id is the only conflict col
+                 print("Warning: No columns left to update on conflict. Using DO NOTHING.")
+                 update_clause = "DO NOTHING"
+            else:
+                set_statements = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_columns])
+                update_clause = f"DO UPDATE SET {set_statements}"
+
             sql = f"""
             INSERT INTO tweets ({columns})
             VALUES ({placeholders})
-            ON CONFLICT ({conflict_clause}) DO NOTHING
+            ON CONFLICT ({conflict_clause}) {update_clause}
             """
-            print(f"Using ON CONFLICT ({conflict_clause}) DO NOTHING")
+            print(f"Using ON CONFLICT ({conflict_clause}) {update_clause}")
         else:
             # Simple insert without conflict handling
             sql = f"""
@@ -1787,6 +1810,8 @@ def identify_and_flag_actionable_tweets(df):
     # Ensure is_deleted column exists and defaulted to False
     if 'is_deleted' not in df.columns:
         df['is_deleted'] = False
+    # else: # Ensure it defaults to False if it exists -- REMOVED THIS, default is handled by flag logic below
+    #     df['is_deleted'] = False
     
     # Apply the strict filters to parents only to identify them
     actionable_parents = apply_strict_filters_corrected(df) # Uses internal logic for parent type
@@ -1803,6 +1828,7 @@ def identify_and_flag_actionable_tweets(df):
     if conversation_id_col is None:
         print("ERROR: Cannot identify conversations to link replies. Aborting flagging.")
         df['is_analytically_actionable'] = False # Ensure column exists even if we abort
+        df['is_deleted'] = True # Mark all as deleted if we can't link
         return df # Return original df without flag
     
     # Ensure conversation ID is string for comparison/lookup
@@ -1824,8 +1850,9 @@ def identify_and_flag_actionable_tweets(df):
 
     print(f"Found {len(actionable_conv_ids)} conversation threads started by actionable parents.")
 
-    # Initialize the flag column to False for all tweets
+    # Initialize the flag columns
     df['is_analytically_actionable'] = False
+    df['is_deleted'] = False # Default to False initially
 
     # Flag all tweets belonging to these actionable conversation threads
     if actionable_conv_ids:
@@ -1833,20 +1860,27 @@ def identify_and_flag_actionable_tweets(df):
         
         # Mark actionable tweets
         df.loc[actionable_mask, 'is_analytically_actionable'] = True
+        df.loc[actionable_mask, 'is_deleted'] = False # Explicitly False for actionable
         
-        # Mark non-actionable tweets as deleted
-        df.loc[~actionable_mask, 'is_deleted'] = True
+        # Mark non-actionable tweets as deleted --- RESTORED THIS LOGIC ---
+        df.loc[~actionable_mask, 'is_deleted'] = True 
+        df.loc[~actionable_mask, 'is_analytically_actionable'] = False # Explicitly False for non-actionable
         
         flagged_count = actionable_mask.sum()
-        deleted_count = (~actionable_mask).sum()
+        deleted_count = (~actionable_mask).sum() # Calculate deleted count
+        # non_actionable_count = (~actionable_mask).sum()
         
         print(f"Flagged {flagged_count} total tweets (parents and replies) as analytically actionable.")
-        print(f"Marked {deleted_count} tweets as deleted (is_deleted = True).")
+        print(f"Marked {deleted_count} tweets as deleted (is_deleted = True).") # Restored message
+        # print(f"Flagged {non_actionable_count} tweets as NOT analytically actionable.")
+
     else:
         print("No actionable conversations found to flag.")
-        # If no actionable conversations, mark all as deleted
+        # If no actionable conversations, mark all as deleted --- RESTORED THIS LOGIC ---
         df['is_deleted'] = True
-        print(f"Marked all {len(df)} tweets as deleted since no actionable conversations were found.")
+        df['is_analytically_actionable'] = False
+        print(f"Marked all {len(df)} tweets as deleted since no actionable conversations were found.") # Restored message
+        # print(f"Flagged all {len(df)} tweets as NOT analytically actionable since no actionable conversations were found.")
 
     # Return the full dataframe with the new flags
     return df
