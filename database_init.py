@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS tweets (
     actual_return FLOAT,
     validated_ticker VARCHAR(50),
     prediction_score FLOAT,
+    is_deleted BOOLEAN DEFAULT FALSE,
+    is_analytically_actionable BOOLEAN DEFAULT FALSE,
     processing_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
