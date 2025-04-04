@@ -1860,7 +1860,7 @@ def create_data_extraction_dashboard():
                         today = datetime.now().strftime("%Y-%m-%d")
                         start_date = "2023-01-01"
                         
-                        tweets = scraper.extract_tweets_with_retry(
+                        tweets = scraper.extract_tweets(
                             twitter_handles=twitter_handles,
                             start_date=start_date,
                             end_date=today,
