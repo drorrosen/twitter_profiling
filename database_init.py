@@ -69,8 +69,9 @@ UNIQUE (tweet_id, created_at, sentiment);
 ALTER TABLE tweets ADD CONSTRAINT check_has_ticker 
 CHECK (tickers_mentioned IS NOT NULL AND tickers_mentioned != '');
 
+-- Allow neutral/unknown sentiments in the database
 ALTER TABLE tweets ADD CONSTRAINT check_has_sentiment
-CHECK (sentiment IN ('bullish', 'bearish'));
+CHECK (sentiment IN ('bullish', 'bearish', 'neutral', 'unknown'));
 
 -- Remove the time horizon constraint
 ALTER TABLE tweets DROP CONSTRAINT IF EXISTS check_has_time_horizon;
