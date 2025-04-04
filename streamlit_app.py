@@ -1860,15 +1860,28 @@ def create_data_extraction_dashboard():
                         today = datetime.now().strftime("%Y-%m-%d")
                         start_date = "2023-01-01"
                         
+                        # --- Prepare the input dictionary first --- 
+                        run_input_dict = scraper.prepare_input(
+                            twitter_handles=twitter_handles, 
+                            max_items=max_items, 
+                            start=start_date, # Use 'start' and 'end' if that's what prepare_input/actor expects
+                            end=today,
+                            # Add other relevant params if needed, e.g., from get_common_params()
+                            tweetLanguage="en",
+                            sort="Latest"
+                        )
+                        print(f"Prepared Apify run_input: {run_input_dict}")
+                        # --- End prepare input --- 
+                        
+                        # Call extract_tweets with the prepared dictionary
+                        # Also pass the correct actor_id if it's different from the default
                         tweets = scraper.extract_tweets(
-                            twitter_handles=twitter_handles,
-                            start_date=start_date,
-                            end_date=today,
-                            max_items=max_items,
-                            retries=3
+                            run_input=run_input_dict,
+                            actor_id="nfp1fpt5gUlBwPcor" # Explicitly pass the desired actor ID
                         )
                         
-                        if not tweets:
+                        # Check if tweets is a list and handle potential errors/empty results
+                        if not isinstance(tweets, list) or not tweets:
                             print("❌ No tweets were extracted. Please check the API connection and handles.")
                             return mystdout.getvalue(), 0
                         
