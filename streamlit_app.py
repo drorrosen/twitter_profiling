@@ -790,23 +790,28 @@ def create_overview_dashboard(df):
     invalid_traders = []
     
     for trader in get_traders(df):
+        # Count actionable parent tweets for validity check
         count = len(df[(df['author'] == trader) & 
                        (df['tweet_type'] == 'parent') & 
-                       (df['sentiment'].isin(['bullish', 'bearish'])) &
-                       (df['time_horizon'].notna() & (df['time_horizon'] != ''))])
+                       (df['sentiment'].isin(['bullish', 'bearish'])) & # Use accurate sentiment check
+                       (df['time_horizon'].notna()) & 
+                       (df['time_horizon'] != 'unknown')]) # Use accurate horizon check
         
         if count >= 3:
             valid_traders.append(trader)
         else:
             invalid_traders.append(trader)
     
-    # --- Create DataFrame containing ALL tweets (deleted & active) from VALID traders ---
+    # --- Create DataFrame containing ALL tweets from VALID traders --- 
+    # This is used for calculating total unique traders and potentially genuine deleted counts (if is_deleted is used for that)
     trader_all_df = df[df['author'].isin(valid_traders)].copy()
 
-    # --- Create the main DataFrame for analysis: only ACTIVE tweets from VALID traders ---
+    # --- Create the main DataFrame for analysis: only ACTIVE tweets from VALID traders --- 
+    # Active means is_deleted == False as flagged by the backend script
     filtered_df = trader_all_df[trader_all_df['is_deleted'] == False].copy()
 
-    # Parent tweets for dashboard: Active, Parent type, AND Bullish/Bearish
+    # Parent tweets for dashboard metrics that require predictions (accuracy, return)
+    # Filter from the active set (filtered_df) 
     parent_tweets = filtered_df[
          (filtered_df['tweet_type'] == 'parent') & 
          (filtered_df['sentiment'].isin(['bullish', 'bearish'])) & 
@@ -815,68 +820,72 @@ def create_overview_dashboard(df):
      ].copy()
 
     # --- Calculate Metrics for Display ---
-    unique_traders = filtered_df['author'].nunique()
-    total_active_tweets = len(filtered_df) # Count of non-deleted tweets from valid traders
+    unique_traders = filtered_df['author'].nunique() # Use filtered_df for unique active traders
+    total_active_tweets = len(filtered_df) # Count of active tweets (parents + replies in actionable threads)
 
-    # Accuracy and Return are based on active parent tweets
+    # Accuracy and Return are based on ACTIVE PARENT tweets
     accuracy_df = parent_tweets[parent_tweets['prediction_correct'].notna()]
     overall_accuracy = accuracy_df['prediction_correct'].mean() * 100 if len(accuracy_df) > 0 else 0
     avg_return = parent_tweets['actual_return'].mean() if 'actual_return' in parent_tweets.columns and not parent_tweets['actual_return'].isna().all() else 0
 
-    # Deleted count and percentage are based on ALL tweets from valid traders
+    # Deleted count and percentage - Based on the is_deleted flag from the script
     total_trader_tweets = len(trader_all_df)
     deleted_count = trader_all_df[trader_all_df['is_deleted'] == True].shape[0]
     deleted_pct = (deleted_count / total_trader_tweets * 100) if total_trader_tweets > 0 else 0
     
-    # --- NEW: Calculate Actionable Tweet Rate ---
-    actionable_tweet_count = len(parent_tweets) # Already filtered strictly
+    # --- Calculate Actionable Tweet Rate (Based on active parent tweets vs total active tweets) ---
+    actionable_tweet_count = len(parent_tweets) # Count only actionable parents now for rate
     actionable_rate = (actionable_tweet_count / total_active_tweets * 100) if total_active_tweets > 0 else 0
 
-    # --- Display Metric Cards (Now 2 Rows of 3 Columns) ---
+    # --- Display Metric Cards (Restored 2 Rows of 3 Columns) ---
     row1_cols = st.columns(3)
-    row2_cols = st.columns(3)
+    row2_cols = st.columns(3) # Restored 3 columns
 
-    # --- Row 1 ---
-    with row1_cols[0]: # Actionable Tweet Rate Card
+    # --- Row 1 --- 
+    with row1_cols[0]: # Actionable Tweet Rate Card (based on parent actionable vs total active)
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-value neutral">{actionable_rate:.1f}%</div>', unsafe_allow_html=True)
-        st.markdown('<div class="metric-label">Actionable Tweet Rate</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="metric-note">{actionable_tweet_count}/{total_active_tweets} tweets</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Actionable Parent Tweet Rate</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-note">{actionable_tweet_count} parents / {total_active_tweets} active tweets</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    with row1_cols[1]: # Unique Traders
+    with row1_cols[1]: # Unique Traders (based on active tweets)
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-value neutral">{unique_traders}</div>', unsafe_allow_html=True)
-        st.markdown('<div class="metric-label">Unique Traders</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Unique Traders (with >=3 Actionable)</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    with row1_cols[2]: # Total Active Tweets
+    with row1_cols[2]: # Total Active Tweets (Parents + Replies in Actionable Threads)
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-value neutral">{total_active_tweets:,}</div>', unsafe_allow_html=True)
         st.markdown('<div class="metric-label">Total Active Tweets</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-note">(Parents + Replies Not Marked Deleted)</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # --- Row 2 ---
-    with row2_cols[0]: # Overall Accuracy
-        accuracy_class = "positive" if overall_accuracy > 50 else "negative"
+    # --- Row 2 --- 
+    with row2_cols[0]: # Overall Accuracy (Based on active parents)
+        accuracy_class = "positive" if overall_accuracy > 50 else ("negative" if overall_accuracy < 50 else "neutral")
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-value {accuracy_class}">{overall_accuracy:.1f}%</div>', unsafe_allow_html=True)
         st.markdown('<div class="metric-label">Overall Accuracy</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-note">(Based on {len(parent_tweets)} active parent tweets)</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    with row2_cols[1]: # Average Return
-        return_class = "positive" if avg_return > 0 else "negative"
+    with row2_cols[1]: # Average Return (Based on active parents)
+        return_class = "positive" if avg_return > 0 else ("negative" if avg_return < 0 else "neutral")
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-value {return_class}">{avg_return:.2f}%</div>', unsafe_allow_html=True)
         st.markdown('<div class="metric-label">Average Return</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-note">(Based on {len(parent_tweets)} active parent tweets)</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    with row2_cols[2]: # Deleted Tweets %
+    # --- RESTORED Deleted Tweets Card --- 
+    with row2_cols[2]: # Deleted Tweets % (Based on is_deleted flag from script)
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-value neutral">{deleted_pct:.1f}%</div>', unsafe_allow_html=True)
-        st.markdown('<div class="metric-label">Deleted Tweets (%)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-label">Excluded Tweets (%)</div>', unsafe_allow_html=True) # Keep clarified Label
         # Show counts based on the trader_all_df used for calculation
-        st.markdown(f'<div class="metric-note">{deleted_count}/{total_trader_tweets} marked</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-note">{deleted_count}/{total_trader_tweets} marked deleted by script</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
     with st.expander("Show traders with insufficient data"):
@@ -948,7 +957,7 @@ def create_overview_dashboard(df):
     col1, col2 = st.columns(2)
 
     with col1: 
-        # Sentiment pie chart now uses the filtered parent_tweets
+        # Sentiment pie chart now uses the active parent tweets
         sentiment_counts = parent_tweets['sentiment'].value_counts()
         sentiment_pcts = sentiment_counts / sentiment_counts.sum() * 100
 
@@ -964,11 +973,11 @@ def create_overview_dashboard(df):
         st.plotly_chart(fig, use_container_width=True)
 
         # Show raw data with relevant columns
-        format_and_display_data(parent_tweets, 
+        format_and_display_data(parent_tweets, # Use active parent tweets 
                                 title="Show Raw Data for Sentiment Distribution")
     
     with col2:
-        # Top stocks count now uses the filtered parent_tweets
+        # Top stocks count now uses the active parent tweets
         # Ensure 'validated_ticker' column exists
         if 'validated_ticker' in parent_tweets.columns:
             stock_counts = parent_tweets['validated_ticker'].value_counts().nlargest(10).reset_index()
@@ -990,26 +999,26 @@ def create_overview_dashboard(df):
 
             # Show filtered raw data with relevant columns
             top_stocks_list = stock_counts['Stock'].tolist()
-            # Base the raw data display on parent_tweets filtered by these top stocks
+            # Base the raw data display on active parent_tweets filtered by these top stocks
             filtered_raw_stock_data = parent_tweets[parent_tweets['validated_ticker'].isin(top_stocks_list)]
             format_and_display_data(filtered_raw_stock_data,
                                     title="Show Raw Data for Top Mentioned Stocks")
         else:
-            st.warning("'validated_ticker' column not found in parent tweets data.")
+            st.warning("'validated_ticker' column not found in active parent tweets data.")
     
     st.markdown('<div class="sub-header">Time Series Analysis</div>', unsafe_allow_html=True)
     
-    # Monthly analysis now uses the filtered_df (which excludes deleted)
+    # Monthly analysis now uses the filtered_df (active tweets)
     if not filtered_df.empty and 'created_date' in filtered_df.columns:
         monthly_df_copy = filtered_df.copy()
         monthly_df_copy['month'] = monthly_df_copy['created_date'].dt.to_period('M').astype(str)
 
-        # Aggregate based on the filtered data
+        # Aggregate based on the active data
         monthly_data = monthly_df_copy.groupby('month').agg(
             tweet_count=('tweet_id', 'count'), # Use a non-nullable column like tweet_id
-            # Calculate accuracy based ONLY on parent tweets within the month
+            # Calculate accuracy based ONLY on ACTIVE PARENT tweets within the month
             avg_accuracy=('prediction_correct', lambda x: (x[monthly_df_copy.loc[x.index, 'tweet_type'] == 'parent'].mean() * 100) if x[monthly_df_copy.loc[x.index, 'tweet_type'] == 'parent'].notna().any() else None),
-            # Calculate return based ONLY on parent tweets within the month
+            # Calculate return based ONLY on ACTIVE PARENT tweets within the month
             avg_return=('actual_return', lambda x: x[monthly_df_copy.loc[x.index, 'tweet_type'] == 'parent'].mean() if 'actual_return' in monthly_df_copy.columns else None)
         ).reset_index()
 
@@ -1077,7 +1086,7 @@ def create_overview_dashboard(df):
         
         st.plotly_chart(fig, use_container_width=True)
 
-        # Show raw data with relevant columns used in aggregation (using filtered_df)
+        # Show raw data with relevant columns used in aggregation (using active filtered_df)
         format_and_display_data(filtered_df, title="Show Raw Data for Monthly Analysis")
     else:
         st.warning("Insufficient data for monthly time series analysis after filtering.")
@@ -2383,16 +2392,16 @@ def create_raw_data_dashboard(df):
     # --- Filter Row 2 ---
     filter_cols_2 = st.columns(4)
     with filter_cols_2[0]:
-        # Modified filter for combined status
+        # Restored original filter using both flags, but remove Active & Non-Actionable
         if 'is_deleted' in df.columns and 'is_analytically_actionable' in df.columns:
             status_options = {
                 "All": None, 
                 "Active & Actionable": "active_actionable", 
-                "Active & Non-Actionable": "active_non_actionable", 
-                "Deleted": "deleted"
+                # "Active & Non-Actionable": "active_non_actionable", # Removed this option
+                "Excluded by Script": "deleted" 
             }
             selected_status_label = st.selectbox(
-                "Filter by Tweet Status", # Renamed label
+                "Filter by Tweet Status", 
                 options=list(status_options.keys()),
                 index=0 # Default to "All"
             )
@@ -2419,7 +2428,7 @@ def create_raw_data_dashboard(df):
                     "Filter by Date Range",
                     value=(min_date, max_date),
                     min_value=min_date,
-                    max_value=max_date,
+                    max_value=max_date, # Corrected argument name
                 )
         else:
             selected_date_range = None
@@ -2470,9 +2479,10 @@ def create_raw_data_dashboard(df):
     if selected_status_key is not None and 'is_deleted' in filtered_df.columns and 'is_analytically_actionable' in filtered_df.columns:
         if selected_status_key == "active_actionable":
             filtered_df = filtered_df[(filtered_df['is_deleted'] == False) & (filtered_df['is_analytically_actionable'] == True)]
-        elif selected_status_key == "active_non_actionable":
-            filtered_df = filtered_df[(filtered_df['is_deleted'] == False) & (filtered_df['is_analytically_actionable'] == False)]
-        elif selected_status_key == "deleted":
+        # elif selected_status_key == "active_non_actionable": # Removed this condition
+        #     # Note: This case should be empty now if non-actionable are marked deleted
+        #     filtered_df = filtered_df[(filtered_df['is_deleted'] == False) & (filtered_df['is_analytically_actionable'] == False)]
+        elif selected_status_key == "deleted": # This now represents those excluded by the script
             filtered_df = filtered_df[filtered_df['is_deleted'] == True]
         # 'All' (None key) case doesn't require filtering here
 
