@@ -1074,8 +1074,8 @@ def upload_to_database(df):
     print(f"\nUploading {len(df)} tweets to database (including replies)")
     
     # First, ensure the database schema accepts all sentiment types
-    if not update_database_schema():
-        print("WARNING: Failed to update database schema. Non-standard sentiment tweets may not be uploaded.")
+    # if not update_database_schema(): # Temporarily commented out as ensure_database_table_exists handles this
+    #     print("WARNING: Failed to update database schema. Non-standard sentiment tweets may not be uploaded.")
     
     # Print tweet types distribution
     tweet_types = df['tweet_type'].value_counts().to_dict()
@@ -1128,7 +1128,7 @@ def upload_to_database(df):
         'author_blue_verified', 'created_date', 'prediction_date',
         'start_price', 'end_price', 'start_date', 'end_date',
         'prediction_correct', 'price_change_pct', 'actual_return',
-        'validated_ticker'
+        'validated_ticker', 'is_deleted', 'is_analytically_actionable'  # Added is_deleted and is_analytically_actionable
     ]
     
     valid_columns = [col for col in valid_columns if col in upload_df.columns]
@@ -1234,7 +1234,7 @@ def upload_to_database(df):
         # Divide into two sets: parent tweets (for prediction) and reply tweets (for context)
         parent_tweets = upload_df[upload_df['tweet_type'] == 'parent']
         reply_tweets = upload_df[upload_df['tweet_type'] == 'reply']
-        
+
         print(f"\nSplit data: {len(parent_tweets)} parent tweets, {len(reply_tweets)} reply tweets")
         
         # Convert NumPy types to Python native types
@@ -1631,7 +1631,9 @@ def ensure_database_table_exists():
                 prediction_correct BOOLEAN,
                 price_change_pct FLOAT,
                 actual_return FLOAT,
-                validated_ticker VARCHAR(50)
+                validated_ticker VARCHAR(50),
+                is_deleted BOOLEAN,
+                is_analytically_actionable BOOLEAN
             );
             
             ALTER TABLE tweets ADD CONSTRAINT check_has_sentiment 
@@ -1759,6 +1761,96 @@ def enrich_text_with_context(df):
     
     return df
 
+def identify_and_flag_actionable_tweets(df):
+    """
+    Identifies actionable trading signals and flags relevant tweets.
+
+    Actionable parent tweets must have:
+    1. Tickers mentioned
+    2. Bullish or bearish sentiment
+    3. Known time horizon
+
+    Flags actionable parents and all their replies with is_analytically_actionable = True.
+    Marks non-actionable tweets as is_deleted = True.
+    Returns the original dataframe with the added flag columns.
+    """
+    print("\nIdentifying and flagging actionable tweets...")
+
+    # Ensure tweet_type column exists
+    if 'tweet_type' not in df.columns:
+        print("Warning: 'tweet_type' column missing. Assuming all are parents for initial filter.")
+        if 'in_reply_to' in df.columns:
+             df['tweet_type'] = df['in_reply_to'].apply(lambda x: 'reply' if pd.notna(x) else 'parent')
+        else:
+             df['tweet_type'] = 'parent' # Fallback
+
+    # Ensure is_deleted column exists and defaulted to False
+    if 'is_deleted' not in df.columns:
+        df['is_deleted'] = False
+    
+    # Apply the strict filters to parents only to identify them
+    actionable_parents = apply_strict_filters_corrected(df) # Uses internal logic for parent type
+    print(f"Identified {len(actionable_parents)} actionable parent tweets meeting criteria.")
+
+    # Handle conversation ID
+    conversation_id_col = None
+    possible_columns = ['conversation_id', 'conversationId', 'in_reply_to', 'thread_id', 'tweet_id'] # Add tweet_id as last resort
+    for col in possible_columns:
+        if col in df.columns:
+            conversation_id_col = col
+            print(f"Using '{col}' as conversation identifier for linking replies.")
+            break
+    if conversation_id_col is None:
+        print("ERROR: Cannot identify conversations to link replies. Aborting flagging.")
+        df['is_analytically_actionable'] = False # Ensure column exists even if we abort
+        return df # Return original df without flag
+    
+    # Ensure conversation ID is string for comparison/lookup
+    df[conversation_id_col] = df[conversation_id_col].astype(str)
+    
+    # Ensure the column exists in actionable_parents before converting
+    if conversation_id_col in actionable_parents.columns:
+         actionable_parents[conversation_id_col] = actionable_parents[conversation_id_col].astype(str)
+    else:
+        # Handle case where conversation_id_col might not be in actionable_parents (e.g., if empty)
+         print(f"Warning: Conversation ID column '{conversation_id_col}' not found in actionable_parents DataFrame.")
+         actionable_conv_ids = set() # No conversations to flag if actionable_parents is empty or lacks the ID
+
+    # Get the conversation IDs of the actionable parent tweets if possible
+    if conversation_id_col in actionable_parents.columns and not actionable_parents.empty:
+        actionable_conv_ids = set(actionable_parents[conversation_id_col].unique())
+    else:
+        actionable_conv_ids = set() # Initialize as empty if column missing or df empty
+
+    print(f"Found {len(actionable_conv_ids)} conversation threads started by actionable parents.")
+
+    # Initialize the flag column to False for all tweets
+    df['is_analytically_actionable'] = False
+
+    # Flag all tweets belonging to these actionable conversation threads
+    if actionable_conv_ids:
+        actionable_mask = df[conversation_id_col].isin(actionable_conv_ids)
+        
+        # Mark actionable tweets
+        df.loc[actionable_mask, 'is_analytically_actionable'] = True
+        
+        # Mark non-actionable tweets as deleted
+        df.loc[~actionable_mask, 'is_deleted'] = True
+        
+        flagged_count = actionable_mask.sum()
+        deleted_count = (~actionable_mask).sum()
+        
+        print(f"Flagged {flagged_count} total tweets (parents and replies) as analytically actionable.")
+        print(f"Marked {deleted_count} tweets as deleted (is_deleted = True).")
+    else:
+        print("No actionable conversations found to flag.")
+        # If no actionable conversations, mark all as deleted
+        df['is_deleted'] = True
+        print(f"Marked all {len(df)} tweets as deleted since no actionable conversations were found.")
+
+    # Return the full dataframe with the new flags
+    return df
+
 def main():
     """
     Main function to run the analysis pipeline.
@@ -1804,41 +1896,56 @@ def main():
         # Explore data columns
         explore_data_columns(df)
         
-        # Filter actionable tweets
-        filtered_data = filter_actionable_tweets(df)
-        
-        # Analyze user accuracy
-        user_metrics = analyze_user_accuracy(filtered_data['actionable_tweets'])
-        
-        # Analyze ticker sentiment
-        ticker_sentiment = analyze_ticker_sentiment(filtered_data['actionable_tweets'])
-        
-        # Generate trading signals
-        trading_signals = generate_trading_signals(ticker_sentiment, user_metrics)
-        
-        # Analyze conversation threads
-        conversation_analysis = analyze_conversation_threads(filtered_data['actionable_tweets'])
-        
-        # Add market validation columns to actionable tweets
-        validated_df = add_market_validation_columns(
-            filtered_data['actionable_tweets']
-        )
-        
-        # Upload to database
-        upload_to_database(validated_df)
-        
-        # Visualize results
-        visualize_results(ticker_sentiment, user_metrics, validated_df)
-        
-        # Save results
-        save_results(
-            filtered_data, 
-            user_metrics, 
-            ticker_sentiment, 
-            trading_signals, 
-            conversation_analysis
-        )
-        
+        # Identify and flag actionable tweets (instead of filtering)
+        df = identify_and_flag_actionable_tweets(df)
+
+        # --- Perform Analysis only on Actionable Subset ---
+        actionable_df = df[df['is_analytically_actionable'] == True].copy()
+        print(f"\nPerforming analysis on {len(actionable_df)} actionable tweets...")
+
+        if not actionable_df.empty:
+            # Calls below now use actionable_df
+            user_metrics = analyze_user_accuracy(actionable_df)
+            ticker_sentiment = analyze_ticker_sentiment(actionable_df)
+            trading_signals = generate_trading_signals(ticker_sentiment, user_metrics)
+            conversation_analysis = analyze_conversation_threads(actionable_df)
+            visualize_results(ticker_sentiment, user_metrics, actionable_df) # Visualize based on actionable
+        else:
+            print("No actionable tweets found for detailed analysis.")
+            user_metrics = pd.DataFrame()
+            ticker_sentiment = pd.DataFrame()
+            trading_signals = pd.DataFrame()
+            conversation_analysis = pd.DataFrame()
+
+        # --- Add Market Validation (operates on actionable subset internally) ---
+        df = add_market_validation_columns(df)
+
+        # --- Ensure required columns for upload exist ---
+        if 'is_deleted' not in df.columns:
+            print("Adding 'is_deleted' column with default False.")
+            df['is_deleted'] = False
+        # Ensure is_analytically_actionable exists (should be added earlier)
+        if 'is_analytically_actionable' not in df.columns:
+            print("Warning: 'is_analytically_actionable' column missing before upload.")
+            # Handle potentially by adding it or erroring, depending on requirements
+            # For now, let's add it defaulted to False if missing, though it should exist
+            df['is_analytically_actionable'] = False 
+
+        # --- Upload FULL DataFrame with flags ---
+        upload_to_database(df)
+
+        # --- Save Results ---
+        print("\nSaving full results to CSV files...")
+        os.makedirs(results_dir, exist_ok=True)
+        df.to_csv(f'{results_dir}/all_processed_tweets_with_flags.csv', index=False)
+        print(f"Saved full dataframe with flags to {results_dir}/all_processed_tweets_with_flags.csv")
+
+        # Optionally save the analysis subsets as before
+        if not user_metrics.empty: user_metrics.to_csv(f'{results_dir}/user_metrics.csv', index=False)
+        if not ticker_sentiment.empty: ticker_sentiment.to_csv(f'{results_dir}/ticker_sentiment.csv', index=False)
+        if not trading_signals.empty: trading_signals.to_csv(f'{results_dir}/trading_signals.csv', index=False)
+        if not conversation_analysis.empty: conversation_analysis.to_csv(f'{results_dir}/conversation_analysis.csv', index=False)
+
         print("\nAnalysis pipeline completed successfully!")
     else:
         print("\nAnalysis pipeline failed: No data to process.")
