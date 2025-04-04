@@ -879,6 +879,7 @@ def create_overview_dashboard(df):
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown(f'<div class="metric-value neutral">{unique_traders}</div>', unsafe_allow_html=True)
         st.markdown('<div class="metric-label">Unique Traders (with >=3 Actionable)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="metric-note">(Count of distinct authors with >=3 actionable tweets)</div>', unsafe_allow_html=True) # Added note
         st.markdown('</div>', unsafe_allow_html=True)
 
     with row1_cols[2]: # Total Active Tweets (Parents + Replies in Actionable Threads)
