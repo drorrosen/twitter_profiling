@@ -1828,7 +1828,8 @@ def create_data_extraction_dashboard():
                 </div>
                 """, unsafe_allow_html=True)
                 
-                def run_extraction_with_logs():
+                # Revert definition - remove pd_module argument
+                def run_extraction_with_logs(): # <--- Removed pd_module
                     import sys
                     from io import StringIO
                     
@@ -1889,8 +1890,8 @@ def create_data_extraction_dashboard():
                         
                         # --- Store tweets in session state --- 
                         try:
-                            # Convert to DataFrame before storing
-                            df_tweets = pd.DataFrame(tweets)
+                            # Convert to DataFrame before storing - use global pd
+                            df_tweets = pd.DataFrame(tweets) # <--- Use pd directly again
                             st.session_state.twitter_data = df_tweets
                             print(f"Stored {len(df_tweets)} tweets into session state.")
                         except Exception as df_err:
@@ -1913,7 +1914,10 @@ def create_data_extraction_dashboard():
                     # return mystdout.getvalue(), 0 
                 
                 with st.spinner("Running tweet extraction... This may take a few minutes."):
-                    logs, tweet_count = run_extraction_with_logs()
+                    # Explicitly declare usage of global pd before calling the nested function
+                    global pd 
+                    # Revert call - remove pd argument
+                    logs, tweet_count = run_extraction_with_logs() # <--- Removed pd argument
                     
                     formatted_logs = logs.replace("\n", "<br>")
                     formatted_logs = formatted_logs.replace("✅", "<span style='color: #17BF63'>✅</span>")
@@ -2027,12 +2031,11 @@ def create_data_extraction_dashboard():
                                 tweet_text = original_tweet_data.get('text', '')
                                 author = original_tweet_data.get('author_userName', original_tweet_data.get('authorUsername', ''))
 
-                                # 1. LLM Classification
-                                # analysis = classify_tweet_func(tweet_text) # Uses the imported function
-                                analysis = twitter_llm_module.classify_tweet_with_llm(tweet_text) # Use the imported function correctly
+                                # 1. LLM Classification - Pass the client
+                                analysis = twitter_llm_module.classify_tweet_with_llm(tweet_text, client)
 
-                                # 2. Regex Tickers
-                                regex_tickers = apify_extractor.extract_tickers_regex(tweet_text)
+                                # 2. Regex Tickers - Use correct module
+                                regex_tickers = twitter_llm_module.extract_tickers_regex(tweet_text)
                                 
                                 # 3. Context Enrichment (Example for Jedi_ant)
                                 enriched_tickers = set(regex_tickers) # Start with regex tickers
@@ -2064,7 +2067,7 @@ def create_data_extraction_dashboard():
                                 failed_result['time_horizon'] = 'error'
                                 failed_result['trade_type'] = 'error'
                                 failed_result['sentiment'] = 'error'
-                                failed_result['tickers_mentioned'] = ', '.join(apify_extractor.extract_tickers_regex(failed_result.get('text','')))
+                                failed_result['tickers_mentioned'] = ', '.join(twitter_llm_module.extract_tickers_regex(failed_result.get('text','')))
                                 return failed_result
                         
                         import concurrent.futures
@@ -2106,7 +2109,7 @@ def create_data_extraction_dashboard():
                                     failed_result['time_horizon'] = 'future_error'
                                     failed_result['trade_type'] = 'future_error'
                                     failed_result['sentiment'] = 'future_error'
-                                    failed_result['tickers_mentioned'] = ', '.join(apify_extractor.extract_tickers_regex(failed_result.get('text','')))
+                                    failed_result['tickers_mentioned'] = ', '.join(twitter_llm_module.extract_tickers_regex(failed_result.get('text','')))
                                     processed_tweets.append(failed_result)
 
                                 completed += 1
