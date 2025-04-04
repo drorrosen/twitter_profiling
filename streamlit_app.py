@@ -738,7 +738,9 @@ def analyze_all_traders(df):
     analysis_df = df[
         (df['is_deleted'] == False) & 
         (df['tweet_type'] == 'parent') & 
-        (df['sentiment'].isin(['bullish', 'bearish']))
+        (df['sentiment'].isin(['bullish', 'bearish'])) &
+        (df['time_horizon'].notna()) & # Added time_horizon check
+        (df['time_horizon'] != 'unknown') # Added time_horizon check
     ].copy()
 
     if analysis_df.empty:
@@ -766,9 +768,6 @@ def analyze_all_traders(df):
         bullish_pct = (trader_tweets['sentiment'] == 'bullish').mean() * 100
         bearish_pct = (trader_tweets['sentiment'] == 'bearish').mean() * 100
         
-        # Calculate follower count
-        followers = trader_tweets['author_followers'].iloc[0] if 'author_followers' in trader_tweets.columns and not trader_tweets['author_followers'].isna().all() else 0
-        
         # Most mentioned tickers
         ticker_column = 'validated_ticker' if 'validated_ticker' in trader_tweets.columns else 'tickers_mentioned'
         top_tickers = ''
@@ -792,7 +791,6 @@ def analyze_all_traders(df):
             'avg_return': avg_return,
             'total_tweets': len(trader_tweets),
             'total_conversations': trader_tweets['conversation_id'].nunique() if 'conversation_id' in trader_tweets.columns else 0,
-            'followers': followers,
             'bullish_pct': bullish_pct,
             'bearish_pct': bearish_pct,
             'top_stocks': top_tickers
@@ -971,11 +969,12 @@ def create_overview_dashboard(df):
         st.markdown("Top traders ranked by prediction accuracy with minimum 3 predictions")
         st.markdown('</div>', unsafe_allow_html=True)
         
-        display_df = top_traders[['trader', 'accuracy', 'avg_return', 'total_tweets', 'followers']].copy()
-        display_df.columns = ['Trader', 'Accuracy (%)', 'Avg Return (%)', 'Tweets', 'Followers']
+        # Display DataFrame without 'Followers'
+        display_df = top_traders[['trader', 'accuracy', 'avg_return', 'total_tweets']].copy()
+        display_df.columns = ['Trader', 'Accuracy (%)', 'Avg Return (%)', 'Tweets']
         display_df['Accuracy (%)'] = display_df['Accuracy (%)'].round(1)
         display_df['Avg Return (%)'] = display_df['Avg Return (%)'].round(2)
-        display_df['Followers'] = display_df['Followers'].apply(lambda x: f"{x:,}")
+        # display_df['Followers'] = display_df['Followers'].apply(lambda x: f"{x:,}") # Removed followers formatting
         
         st.dataframe(display_df, use_container_width=True, height=400)
     
@@ -1122,16 +1121,22 @@ def create_overview_dashboard(df):
     
     
     display_df = trader_metrics.sort_values('accuracy', ascending=False).copy()
+    # Update column list to remove Followers
     display_df.columns = [
         'Trader', 'Accuracy (%)', 'Avg Return (%)', 'Total Tweets', 'Total Conversations',
-        'Followers', 'Bullish (%)', 'Bearish (%)', 'Top Stocks'
+        # 'Followers', # Removed Followers
+        'Bullish (%)', 'Bearish (%)', 'Top Stocks'
     ]
     display_df['Accuracy (%)'] = display_df['Accuracy (%)'].round(1)
     display_df['Avg Return (%)'] = display_df['Avg Return (%)'].round(2)
     display_df['Bullish (%)'] = display_df['Bullish (%)'].round(1)
     display_df['Bearish (%)'] = display_df['Bearish (%)'].round(1)
-    display_df['Followers'] = display_df['Followers'].apply(lambda x: f"{x:,}")
+    # display_df['Followers'] = display_df['Followers'].apply(lambda x: f"{x:,}") # Removed Followers formatting
     
+    # Ensure the dataframe being displayed doesn't have the Followers column either
+    if 'Followers' in display_df.columns:
+        display_df = display_df.drop(columns=['Followers'])
+        
     st.dataframe(display_df, use_container_width=True, height=400)
 
 
