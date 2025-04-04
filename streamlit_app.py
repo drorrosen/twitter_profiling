@@ -348,14 +348,37 @@ def load_data(filepath=None):
         if 'prediction_date' in df.columns and 'prediction_correct' in df.columns:
             df.loc[df['prediction_date'] > pd.Timestamp.today(), 'prediction_correct'] = None
         
+        # Ensure boolean flags exist and handle potential string values from DB
         if 'is_deleted' in df.columns:
-            df['is_deleted'] = df['is_deleted'].fillna(False).astype(bool)
+            df['is_deleted'] = df['is_deleted'].replace({'true': True, 'false': False}).fillna(False).astype(bool)
         else:
             df['is_deleted'] = False
         
-        if 'tweet_type' not in df.columns:
-            df['tweet_type'] = 'parent'
+        if 'is_analytically_actionable' in df.columns:
+            df['is_analytically_actionable'] = df['is_analytically_actionable'].replace({'true': True, 'false': False}).fillna(False).astype(bool)
+        else:
+            df['is_analytically_actionable'] = False
         
+        if 'tweet_type' not in df.columns:
+            df['tweet_type'] = 'parent' # Basic default
+        
+        # --- START: Explicit Filtering Safeguard --- 
+        # Forcefully mark parent tweets with neutral/unknown sentiment as deleted/non-actionable
+        # This overrides any potentially incorrect flags loaded from the database.
+        print("Applying frontend filter safeguard for neutral/unknown parent tweets...")
+        neutral_unknown_parent_mask = (
+            (df['tweet_type'] == 'parent') &
+            (df['sentiment'].isin(['neutral', 'unknown']))
+        )
+        count_to_correct = neutral_unknown_parent_mask.sum()
+        if count_to_correct > 0:
+            print(f"Found {count_to_correct} neutral/unknown parent tweets. Forcing is_deleted=True, is_analytically_actionable=False.")
+            df.loc[neutral_unknown_parent_mask, 'is_deleted'] = True
+            df.loc[neutral_unknown_parent_mask, 'is_analytically_actionable'] = False
+        else:
+             print("No neutral/unknown parent tweets found requiring frontend correction.")
+        # --- END: Explicit Filtering Safeguard --- 
+
         if 'trader' not in df.columns:
             df['trader'] = df['author']
         
@@ -367,26 +390,29 @@ def load_data(filepath=None):
                 return abs(float(row['price_change_pct'])) * multiplier
             df['prediction_score'] = df.apply(calculate_prediction_score, axis=1)
         
-        full_df = df.copy()
-        actionable_df = df[
-            (df['tweet_type'] == 'parent') &
-            (df['sentiment'].isin(['bullish', 'bearish'])) &
-            (df['time_horizon'].notna() & (df['time_horizon'] != ''))
-        ]
-        actionable_conv_ids = actionable_df['conversation_id'].unique()
-        df = full_df[full_df['conversation_id'].isin(actionable_conv_ids)]
+        # The filtering below based on actionable status is now less critical for defining
+        # the main df, but can be kept for context or removed if create_overview_dashboard
+        # handles the subsetting directly.
+        # full_df = df.copy()
+        # actionable_df = df[
+        #     (df['tweet_type'] == 'parent') &
+        #     (df['sentiment'].isin(['bullish', 'bearish'])) &
+        #     (df['time_horizon'].notna() & (df['time_horizon'] != '')) &
+        #     (df['is_deleted'] == False) # Ensure we only consider active ones here if needed
+        # ]
+        # actionable_conv_ids = actionable_df['conversation_id'].unique()
+        # df = full_df[full_df['conversation_id'].isin(actionable_conv_ids)]
         
-        print(f"Full dataset: {len(full_df)} tweets")
-        print(f"Actionable parent tweets: {len(actionable_df)} tweets")
-        print(f"Filtered dataset (actionable conversations): {len(df)} tweets")
+        # print(f"Full dataset: {len(full_df)} tweets")
+        # print(f"Actionable parent tweets: {len(actionable_df)} tweets")
+        # print(f"Filtered dataset (actionable conversations): {len(df)} tweets")
         
+        print(f"Loaded and preprocessed dataframe has {len(df)} rows and columns: {df.columns.tolist()}")
         return df
     
     except Exception as e:
         st.error(f"Error processing data: {e}")
         import traceback
-        traceback.print_exc()
-        return None
 
 def get_traders(df):
     if 'author' not in df.columns:
@@ -2209,6 +2235,22 @@ def create_data_extraction_dashboard():
                         validated_count = df_validated[df_validated['prediction_correct'].notna()].shape[0]
                         st.info(f"{validated_count} tweets have market validation results.")
                     # --- End Market Validation Step ---
+
+                    # --- DEBUG: Check flags before upload --- 
+                    st.info("DEBUG: Checking flags before upload...")
+                    debug_df = df_validated.copy()
+                    # Find some neutral/unknown parent tweets
+                    neutral_parents_sample = debug_df[
+                        (debug_df['tweet_type'] == 'parent') & 
+                        (debug_df['sentiment'].isin(['neutral', 'unknown']))
+                    ].head(5) # Get up to 5 examples
+                    
+                    if not neutral_parents_sample.empty:
+                        st.write("Sample Neutral/Unknown Parent Tweets Before Upload:")
+                        st.dataframe(neutral_parents_sample[['tweet_id', 'sentiment', 'is_deleted', 'is_analytically_actionable']])
+                    else:
+                        st.write("No Neutral/Unknown Parent Tweets found in this batch to debug.")
+                    # --- END DEBUG ---
 
                     # --- Upload the FULL FLAGGED and VALIDATED DataFrame ---
                     with st.spinner("Uploading data to database..."): 
