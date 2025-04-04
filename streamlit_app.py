@@ -1887,15 +1887,31 @@ def create_data_extraction_dashboard():
                         
                         print(f"✅ Successfully extracted {len(tweets)} tweets")
                         
+                        # --- Store tweets in session state --- 
+                        try:
+                            # Convert to DataFrame before storing
+                            import pandas as pd # Add import here
+                            df_tweets = pd.DataFrame(tweets)
+                            st.session_state.twitter_data = df_tweets
+                            print(f"Stored {len(df_tweets)} tweets into session state.")
+                        except Exception as df_err:
+                            print(f"Error converting tweets to DataFrame or storing in session state: {df_err}")
+                            return mystdout.getvalue(), 0 # Return 0 if conversion/storage fails
+                        # --- End store --- 
+                        
+                        # --- Return the actual count upon success --- 
+                        return mystdout.getvalue(), len(tweets)
+                        
                     except Exception as e:
                         print(f"Error during extraction: {str(e)}")
                         import traceback
                         traceback.print_exc(file=mystdout)
-                        return mystdout.getvalue(), 0
+                        return mystdout.getvalue(), 0 # Return 0 on error
                     finally:
                         sys.stdout = old_stdout
                     
-                    return mystdout.getvalue(), 0
+                    # This return was causing the count to always be 0 on success
+                    # return mystdout.getvalue(), 0 
                 
                 with st.spinner("Running tweet extraction... This may take a few minutes."):
                     logs, tweet_count = run_extraction_with_logs()
