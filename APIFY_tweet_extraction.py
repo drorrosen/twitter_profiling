@@ -10,7 +10,7 @@ from googleapiclient.errors import HttpError
 import psycopg2
 
 # Sample mode flag - set to True to fetch only a small number of tweets for testing
-SAMPLE_MODE = True
+SAMPLE_MODE = False
 # Number of tweets to fetch in sample mode
 SAMPLE_SIZE = 100
 
@@ -21,9 +21,10 @@ DB_USER = "postgres"
 DB_PASSWORD = "DrorMai531"
 
 class TwitterScraper:
-    def __init__(self, api_token: str):
-        """Initialize the Twitter scraper with Apify API token."""
+    def __init__(self, api_token: str, actor_id: str = "61RPP7dywgiy0JPD0"):
+        """Initialize the Twitter scraper with Apify API token and optional actor ID."""
         self.client = ApifyClient(api_token)
+        self.actor_id = actor_id
         
     def prepare_input(self, 
                      start_urls: List[str] = None,
@@ -46,10 +47,13 @@ class TwitterScraper:
         run_input.update(kwargs)
         return run_input
 
-    def extract_tweets(self, run_input: Dict) -> List[Dict]:
+    def extract_tweets(self, run_input: Dict, actor_id: str = None) -> List[Dict]:
         """Run the Apify Actor and extract tweets."""
+        # Use provided actor_id or fallback to default
+        actor_to_use = actor_id or self.actor_id
+        
         # Run the Actor and wait for it to finish
-        run = self.client.actor("61RPP7dywgiy0JPD0").call(run_input=run_input)
+        run = self.client.actor(actor_to_use).call(run_input=run_input)
         
         # Fetch results from the run's dataset
         tweets = list(self.client.dataset(run["defaultDatasetId"]).iterate_items())
@@ -273,7 +277,7 @@ def get_author_date_ranges_from_db():
         print(f"Error getting author date ranges: {e}")
         return {}
 
-def process_current_tweets(scraper, twitter_handles, period="daily"):
+def process_current_tweets(scraper, twitter_handles, period="daily", max_items=10000):
     """Process current tweets (daily or weekly)."""
     today = datetime.now().strftime("%Y-%m-%d")
     
@@ -326,22 +330,39 @@ def process_current_tweets(scraper, twitter_handles, period="daily"):
     
     print(f"Updating {period} tweets for {len(handles_to_update)} handles: {', '.join(handles_to_update)}")
     
-    # Configure the run input with specific parameters
-    common_params = get_common_params()
-    
     # Use sample size if in sample mode, otherwise use original size
-    max_items = SAMPLE_SIZE if SAMPLE_MODE else 10000
+    # max_items = SAMPLE_SIZE if SAMPLE_MODE else 10000 # Use passed max_items
     
-    run_input = scraper.prepare_input(
-        twitter_handles=handles_to_update,
-        max_items=max_items,
-        start=start_date,
-        end=today,
-        **common_params
-    )
+    # Use simplified format with the new actor ID
+    run_input = {
+        "twitterHandles": handles_to_update,
+        "sort": "Latest",
+        "maxItems": max_items, # Use passed argument
+        "start": start_date,
+        "end": today,
+        "tweetLanguage": "en"
+    }
     
-    # Extract tweets
-    tweets = scraper.extract_tweets(run_input)
+    # Extract tweets using the new actor ID
+    try:
+        # Use the new actor ID
+        new_actor_id = "nfp1fpt5gUlBwPcor"
+        run = scraper.client.actor(new_actor_id).call(run_input=run_input)
+        tweets = list(scraper.client.dataset(run["defaultDatasetId"]).iterate_items())
+        
+        # Check if we got actual tweet data
+        if tweets:
+            if isinstance(tweets[0], dict) and "noResults" in tweets[0]:
+                print("No valid tweets returned from actor - got 'noResults' objects")
+                tweets = []
+            else:
+                print(f"Successfully fetched {len(tweets)} tweets with new actor")
+        else:
+            print("No tweets returned from actor")
+                
+    except Exception as e:
+        print(f"Error with actor: {str(e)}")
+        tweets = []
     
     return tweets
 
@@ -364,7 +385,7 @@ def save_processed_handles(handles):
     except Exception as e:
         print(f"Error saving processed handles: {e}")
 
-def process_historical_tweets_for_new_handles(scraper, all_handles, processed_handles):
+def process_historical_tweets_for_new_handles(scraper, all_handles, processed_handles, max_items=150000):
     """Process historical tweets only for handles that haven't been processed before."""
     # First check which handles are already in the database
     existing_authors = get_existing_authors_from_db()
@@ -422,52 +443,77 @@ def process_historical_tweets_for_new_handles(scraper, all_handles, processed_ha
     
     print(f"Fetching historical tweets from {start_date} to {today}")
     
-    # Configure the run input with specific parameters
-    common_params = get_common_params()
+    # Use simplified format with the new actor ID
+    run_input = {
+        "twitterHandles": new_handles,
+        "sort": "Latest",
+        "maxItems": max_items, # Use passed argument
+        "start": start_date,
+        "end": today,
+        "tweetLanguage": "en"
+    }
     
-    # Use sample size if in sample mode, otherwise use original size
-    max_items = SAMPLE_SIZE if SAMPLE_MODE else 150000
-    
-    run_input = scraper.prepare_input(
-        twitter_handles=new_handles,
-        max_items=max_items,  # Modified to respect sample mode
-        start=start_date,
-        end=today,
-        **common_params
-    )
-    
-    # Extract tweets
-    tweets = scraper.extract_tweets(run_input)
-    
-    # Add the new handles to the processed list
-    processed_handles.extend(new_handles)
-    save_processed_handles(processed_handles)
+    # Extract tweets using the new actor ID
+    try:
+        new_actor_id = "nfp1fpt5gUlBwPcor"
+        run = scraper.client.actor(new_actor_id).call(run_input=run_input)
+        tweets = list(scraper.client.dataset(run["defaultDatasetId"]).iterate_items())
+        
+        # Check if we got actual tweet data
+        if tweets:
+            if isinstance(tweets[0], dict) and "noResults" in tweets[0]:
+                print("No valid tweets returned from actor - got 'noResults' objects")
+                tweets = []
+            else:
+                print(f"Successfully fetched {len(tweets)} tweets with new actor")
+                # Add the new handles to the processed list
+                processed_handles.extend(new_handles)
+                save_processed_handles(processed_handles)
+        else:
+            print("No tweets returned from actor")
+                
+    except Exception as e:
+        print(f"Error with actor: {str(e)}")
+        tweets = []
     
     return tweets
 
-def process_historical_tweets(scraper, twitter_handles):
+def process_historical_tweets(scraper, twitter_handles, max_items=150000):
     """Process historical tweets from 2023 until now."""
     today = datetime.now().strftime("%Y-%m-%d")
     start_date = "2023-01-01"
     
     print(f"Fetching historical tweets from {start_date} to {today}")
     
-    # Configure the run input with specific parameters
-    common_params = get_common_params()
+    # Use simplified format with the new actor ID
+    run_input = {
+        "twitterHandles": twitter_handles,
+        "sort": "Latest",
+        "maxItems": max_items, # Use passed argument
+        "start": start_date,
+        "end": today,
+        "tweetLanguage": "en"
+    }
     
-    # Use sample size if in sample mode, otherwise use original size
-    max_items = SAMPLE_SIZE if SAMPLE_MODE else 150000
-    
-    run_input = scraper.prepare_input(
-        twitter_handles=twitter_handles,
-        max_items=max_items,  # Modified to respect sample mode
-        start=start_date,
-        end=today,
-        **common_params
-    )
-    
-    # Extract tweets
-    tweets = scraper.extract_tweets(run_input)
+    # Extract tweets using the new actor ID
+    try:
+        new_actor_id = "nfp1fpt5gUlBwPcor"
+        run = scraper.client.actor(new_actor_id).call(run_input=run_input)
+        tweets = list(scraper.client.dataset(run["defaultDatasetId"]).iterate_items())
+        
+        # Check if we got actual tweet data
+        if tweets:
+            if isinstance(tweets[0], dict) and "noResults" in tweets[0]:
+                print("No valid tweets returned from actor - got 'noResults' objects")
+                tweets = []
+            else:
+                print(f"Successfully fetched {len(tweets)} tweets with new actor")
+        else:
+            print("No tweets returned from actor")
+                
+    except Exception as e:
+        print(f"Error with actor: {str(e)}")
+        tweets = []
     
     return tweets
 
@@ -498,42 +544,92 @@ def print_processed_vs_database_status():
         if len(missing_from_processed) > 10:
             print(f"   - ... and {len(missing_from_processed) - 10} more")
 
-def main():
-    # API token
-    api_token = "apify_api_kdevcdwOVQ5K4HugmeLYlaNgaxeOGG3dkcwc"
+def scrape_example_handles(scraper):
+    """
+    Example function that scrapes tweets from specific Twitter handles
+    and saves them to a CSV file.
+    """
+    print("\n🔍 RUNNING EXAMPLE: Scraping specific Twitter handles")
     
-    # Initialize scraper
-    scraper = TwitterScraper(api_token)
+    # Specific handles to scrape - only these two as requested
+    example_handles = ["BullTradeFinder", "Jedi_ant"]
+    print(f"Scraping example handles: {', '.join(example_handles)}")
     
-    # Get Twitter handles from Google Sheet
-    twitter_handles, twitter_lists = get_twitter_handles_from_sheet()
+    # Use the new actor ID from the new example
+    new_actor_id = "nfp1fpt5gUlBwPcor"
+    print(f"Using new actor ID: {new_actor_id}")
     
-    if not twitter_handles:
-        print("No Twitter handles found. Exiting.")
-        return
+    # Format using the simplified structure from the new example
+    run_input = {
+        "twitterHandles": example_handles,
+        "sort": "Latest",
+        "maxItems": 150000,
+        "start": "2022-01-01",
+        "end": "2025-02-25",
+        "tweetLanguage": "en"
+    }
     
-    # Print debug information comparing processed handles to database
-    print_processed_vs_database_status()
+    print(f"Fetching tweets from 2022-01-01 to 2025-02-25")
     
-    # Load the list of handles that have already been processed historically
-    processed_handles = load_processed_handles()
-    print(f"Previously processed {len(processed_handles)} handles historically")
+    # Try with the new actor ID
+    try:
+        run = scraper.client.actor(new_actor_id).call(run_input=run_input)
+        example_tweets = list(scraper.client.dataset(run["defaultDatasetId"]).iterate_items())
+         
+        # Check if we got valid tweet data
+        if example_tweets:
+            if isinstance(example_tweets[0], dict) and "noResults" in example_tweets[0]:
+                print("No valid tweets returned from actor - got 'noResults' objects")
+                example_tweets = []
+            else:
+                print(f"Successfully fetched {len(example_tweets)} tweets with new actor")
+        else:
+            print("No tweets returned from actor")
+            
+    except Exception as e:
+        print(f"Error with new actor: {str(e)}")
+        example_tweets = []
     
-    # Process current tweets (daily) for all handles that need updates
-    current_tweets = process_current_tweets(scraper, twitter_handles, period="daily")
-    print(f"Processed {len(current_tweets)} current tweets")
-    
-    # Process historical tweets only for new handles not in the database
-    new_historical_tweets = process_historical_tweets_for_new_handles(
-        scraper, twitter_handles, processed_handles)
-    print(f"Processed {len(new_historical_tweets)} historical tweets for new handles")
-    
-    # Combine all tweets and save to organized_tweets.csv
-    all_tweets = current_tweets + new_historical_tweets
-    if all_tweets:
-        print(f"Total tweets processed: {len(all_tweets)}")
+    # Save to example CSV file
+    if example_tweets:
+        example_file = 'example_tweets.csv'
+        scraper.save_to_csv(example_tweets, output_file=example_file)
+        print(f"✅ Example complete: {len(example_tweets)} tweets saved to {example_file}")
+        
+        # Also save to JSON for easier inspection
+        json_file = 'example_tweets.json'
+        scraper.save_to_json(example_tweets, output_file=json_file)
+        print(f"✅ Also saved data to {json_file} for easier inspection")
     else:
-        print("No new tweets processed")
+        print("❌ No tweets found for example handles")
+    
+    return example_tweets
+
+def main():
+    # Initialize scraper with API token
+    api_token = "apify_api_kdevcdwOVQ5K4HugmeLYlaNgaxeOGG3dkcwc"
+    # Use the new actor ID from the updated example
+    new_actor_id = "nfp1fpt5gUlBwPcor"
+    scraper = TwitterScraper(api_token, actor_id=new_actor_id)
+    
+    print("\n⚠️ NOTE: Updated to use the new actor ID: nfp1fpt5gUlBwPcor")
+    
+    # Run only the example function to extract tweets for BullTradeFinder and JediAnt
+    example_tweets = scrape_example_handles(scraper)
+    
+    # Let the user know if we successfully found tweets
+    if example_tweets:
+        print(f"Successfully extracted {len(example_tweets)} tweets from BullTradeFinder and JediAnt")
+    else:
+        print("No tweets found for BullTradeFinder and Jedi_ant")
 
 if __name__ == "__main__":
-    main()
+    # Initialize scraper with API token
+    api_token = "apify_api_kdevcdwOVQ5K4HugmeLYlaNgaxeOGG3dkcwc"
+    # Use the new actor ID from the updated example
+    new_actor_id = "nfp1fpt5gUlBwPcor"
+    scraper = TwitterScraper(api_token, actor_id=new_actor_id)
+    
+    # Run only the example function
+    scrape_example_handles(scraper)
+    
