@@ -471,7 +471,7 @@ def process_tweets_in_parallel(tweet_list, client: OpenAI, max_workers=8, prompt
     else:
         return pd.DataFrame()
 
-# Function for enhanced analysis with LLM using parallel processing
+# Function for enhanced analysis with LLM using parallel processing - Requires client
 def analyze_all_tweets_with_parallel_llm(organized_tweets, client: OpenAI, max_workers=8, custom_prompt: str | None = None):
     """Analyze all organized tweets with parallel LLM processing. Requires an OpenAI client instance."""
     print("\nRunning parallel LLM analysis on ALL tweets...")
@@ -484,35 +484,46 @@ def analyze_all_tweets_with_parallel_llm(organized_tweets, client: OpenAI, max_w
     all_tweets = []
 
     for thread in organized_tweets:
-        # Add parent tweet with a type indicator
+        # Add parent tweet with a type indicator and pre-extracted regex tickers
         parent = thread['tweet']
         parent['is_parent'] = True
+        parent['tickers_regex'] = extract_tickers_regex(parent.get('text', '')) # Pre-extract
         all_tweets.append(parent)
 
-        # Add replies with a type indicator
+        # Add replies with a type indicator and pre-extracted regex tickers
         for reply in thread['replies']:
             reply['is_parent'] = False
             reply['in_reply_to'] = parent.get('id', '')
+            reply['tickers_regex'] = extract_tickers_regex(reply.get('text', '')) # Pre-extract
             all_tweets.append(reply)
 
     print(f"Prepared {len(all_tweets)} tweets for parallel processing")
 
     # Process all tweets in parallel, passing the custom prompt and client
     start_time = time.time()
-    results_df = process_tweets_in_parallel(all_tweets, client=client, max_workers=max_workers, prompt_to_use=custom_prompt)
+    results_df = process_tweets_in_parallel(
+        all_tweets,
+        client=client, # Pass the client instance
+        max_workers=max_workers,
+        prompt_to_use=custom_prompt # Pass the prompt
+    )
     end_time = time.time()
 
     # Save to CSV
     if not results_df.empty:
         output_file = 'all_tweets_llm_analysis.csv'
-        results_df.to_csv(output_file, index=False)
-        print(f"\nSaved complete LLM analysis to {output_file}")
-        
+        try:
+             results_df.to_csv(output_file, index=False, encoding='utf-8-sig') # Added encoding
+             print(f"\nSaved complete LLM analysis to {output_file}")
+        except Exception as csv_err:
+            print(f"Error saving results to CSV: {csv_err}")
+
         # Print completion time
         total_time = end_time - start_time
         print(f"\nCompleted LLM analysis on {len(results_df)} tweets in {str(timedelta(seconds=int(total_time)))}")
-        print(f"Average processing time: {total_time/len(results_df):.2f} seconds per tweet")
-        
+        if len(results_df) > 0:
+             print(f"Average processing time: {total_time/len(results_df):.2f} seconds per tweet")
+
         # Print sentiment distribution
         if 'sentiment' in results_df.columns:
             sentiment_counts = results_df['sentiment'].value_counts()
@@ -520,7 +531,7 @@ def analyze_all_tweets_with_parallel_llm(organized_tweets, client: OpenAI, max_w
             for sentiment, count in sentiment_counts.items():
                 percentage = (count / len(results_df)) * 100
                 print(f"{sentiment}: {count} tweets ({percentage:.1f}%)")
-    
+
     return results_df
 
 # Re-define constant just before __main__ block as a workaround
@@ -563,65 +574,76 @@ Guidelines for classification:
 if __name__ == "__main__":
     # Load the data from our example file instead of twitter_data.csv
     print("Loading data from example_tweets.csv...")
-    df = pd.read_csv('example_tweets.csv', low_memory=False)
+    try:
+        # Specify encoding in case of issues
+        df = pd.read_csv('example_tweets.csv', low_memory=False, encoding='utf-8')
+    except FileNotFoundError:
+        print("Error: example_tweets.csv not found. Please create this file for standalone testing.")
+        import sys # Import sys here if not already imported
+        sys.exit(1) # Exit if file not found
+    except Exception as load_err:
+        print(f"Error loading example_tweets.csv: {load_err}")
+        import sys # Import sys here if not already imported
+        sys.exit(1) # Exit on other loading errors
+
     cols_to_drop = [col for col in df.columns if 'Unnamed' in col]
     df = df.drop(cols_to_drop, axis=1)
-    
+
     print(f"Loaded {len(df)} tweets from example_tweets.csv")
     print("Column names:", df.columns.tolist())
-    
+
     # Check if author and entities columns exist and are in the right format
-    author_col = 'author' if 'author' in df.columns else None
-    entities_col = 'entities' if 'entities' in df.columns else None
-    
-    print(f"Author column: {author_col}")
-    print(f"Entities column: {entities_col}")
-    
+    # Use case-insensitive check for column names if necessary
+    author_col = next((col for col in df.columns if col.lower() == 'author'), None)
+    entities_col = next((col for col in df.columns if col.lower() == 'entities'), None)
+
+    print(f"Author column found: {author_col}")
+    print(f"Entities column found: {entities_col}")
+
     # Expand both columns if they exist
     if author_col:
         df = expand_column(df, author_col)
     if entities_col:
         df = expand_column(df, entities_col)
-    
+
     print("\nExpanded columns:")
     print(df.columns.tolist())
-    print("\nFirst few rows:")
-    print(df.head())
-    
+    # print("\nFirst few rows:") # Commented out for brevity
+    # print(df.head())
+
     # Organize the tweets into conversation threads
     organized_tweets = organize_tweets(df)
-    
+
     # Run the basic analysis
     print("\nRunning basic analysis without LLM...")
     basic_results = analyze_sample_tweets(organized_tweets)
-    
+
     # Now run the parallel processing on ALL tweets
     print("\nNow running parallel LLM analysis on ALL tweets...")
     # Use 8 workers as requested for optimal performance
     MAX_WORKERS = 8
-    
+
     # Initialize client here for standalone execution
-    # You might want to load API_KEY from env var or a local file for standalone runs
+    # Load API_KEY from environment variable for standalone runs
     try:
-        standalone_api_key = os.environ.get("OPENAI_API_KEY") # Example: Load from environment variable
+        standalone_api_key = os.environ.get("OPENAI_API_KEY")
         if not standalone_api_key:
-             # Fallback or error if key not found for standalone run
-             # For testing, you could hardcode temporarily, but avoid committing it
              print("Warning: OPENAI_API_KEY environment variable not set for standalone run.")
-             # standalone_api_key = "your_temp_key_for_local_test_only"
-             # For now, let's raise an error if not set
-             raise ValueError("API key needed for standalone execution")
-             
-        standalone_client = OpenAI(api_key=standalone_api_key)
-        # Pass the client and the default prompt for the example run
-        all_results = analyze_all_tweets_with_parallel_llm(
-            organized_tweets, 
-            client=standalone_client, 
-            max_workers=MAX_WORKERS, 
-            custom_prompt=DEFAULT_CLASSIFICATION_PROMPT
-        )
+             # You could potentially skip LLM analysis or raise an error
+             # For now, let's try to proceed without LLM if key is missing
+             print("Skipping LLM analysis due to missing API key.")
+             all_results = pd.DataFrame() # Empty DataFrame if no key
+        else:
+            standalone_client = OpenAI(api_key=standalone_api_key)
+            # Pass the client and the default prompt for the example run
+            all_results = analyze_all_tweets_with_parallel_llm(
+                organized_tweets,
+                client=standalone_client,
+                max_workers=MAX_WORKERS,
+                custom_prompt=DEFAULT_CLASSIFICATION_PROMPT # Use default prompt for test
+            )
     except Exception as main_exec_err:
-         print(f"Error during standalone execution: {main_exec_err}")
+         print(f"Error during standalone LLM execution setup or run: {main_exec_err}")
          all_results = pd.DataFrame() # Ensure all_results is defined
 
     print("\nAnalysis complete!")
