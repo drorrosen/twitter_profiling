@@ -322,12 +322,14 @@ def analyze_sample_tweets(organized_tweets):
     return df_results
 
 # Function to classify a single tweet with LLM
-def classify_tweet_with_llm(text: str, client: OpenAI) -> dict:
+def classify_tweet_with_llm(text: str, client: OpenAI, custom_prompt: str | None = None) -> dict:
     """
-    Use OpenAI's GPT model to classify a tweet for financial analysis.
-    Returns a dictionary with sentiment, tickers, time horizon, trade type, and price targets.
+    Use GPT-4o to analyze tweets and extract structured information.
+    Accepts an optional custom_prompt to override the default system prompt.
+    Requires an OpenAI client instance.
     """
-    if pd.isna(text) or not text:
+    # Skip empty or NaN text
+    if pd.isna(text) or not text or text.strip() == '':
         return {
             'sentiment': 'unknown',
             'tickers': '',
@@ -339,7 +341,7 @@ def classify_tweet_with_llm(text: str, client: OpenAI) -> dict:
         }
     
     # Create a prompt for the GPT model
-    prompt = f"""
+    prompt = custom_prompt if custom_prompt else f"""
     Analyze this tweet for financial trading context. Extract the following information:
     
     Tweet: "{text}"
@@ -405,29 +407,37 @@ def classify_tweet_with_llm(text: str, client: OpenAI) -> dict:
         }
 
 # Function to process tweets in parallel
-def process_tweets_in_parallel(tweet_list, client: OpenAI, max_workers=8):
-    """
-    Process a list of tweets in parallel using the LLM classification function.
-    """
+def process_tweets_in_parallel(tweet_list, client: OpenAI, max_workers=8, prompt_to_use: str | None = None):
+    """Process a list of tweets in parallel using multiple workers. Requires an OpenAI client instance."""
+    start_time = time.time()
+    total_tweets = len(tweet_list)
+    processed = 0
+    results = []
+
+    print(f"Processing {total_tweets} tweets with {max_workers} workers...")
+
     # Function to process a single tweet
     def process_single_tweet(tweet):
         try:
-            # Extract the text and id
+            # Extract tickers using regex
+            tickers = tweet.get('tickers_regex', [])
+
+            # Analyze with LLM using the provided prompt and client
             tweet_text = tweet.get('text', '')
-            tweet_id = tweet.get('id', '')
-            
-            # Classify with LLM
-            llm_result = classify_tweet_with_llm(tweet_text, client)
-            
+            analysis = classify_tweet_with_llm(tweet_text, client=client, custom_prompt=prompt_to_use)
+
+            # Get the author
+            author = tweet.get('author_userName', tweet.get('authorUsername', ''))
+
             # Combine the tweet data with the LLM results
             result = {
-                'id': tweet_id,
+                'id': tweet.get('id', ''),
                 'text': tweet_text,
-                'author': tweet.get('author', ''),
+                'author': author,
                 'created_at': tweet.get('createdAt', ''),
                 'is_parent': tweet.get('is_parent', True),
                 'in_reply_to': tweet.get('in_reply_to', ''),
-                **llm_result
+                **analysis
             }
             
             return result
@@ -436,8 +446,6 @@ def process_tweets_in_parallel(tweet_list, client: OpenAI, max_workers=8):
             return None
     
     # Process tweets in parallel
-    all_results = []
-    
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks and create a map of future to tweet id
         future_to_id = {executor.submit(process_single_tweet, tweet): tweet.get('id', i) 
@@ -449,7 +457,7 @@ def process_tweets_in_parallel(tweet_list, client: OpenAI, max_workers=8):
             try:
                 result = future.result()
                 if result:
-                    all_results.append(result)
+                    results.append(result)
                 
                 # Print progress update every 10 tweets
                 if (i+1) % 10 == 0 or i+1 == len(tweet_list):
@@ -458,35 +466,42 @@ def process_tweets_in_parallel(tweet_list, client: OpenAI, max_workers=8):
                 print(f"Error processing tweet {tweet_id}: {e}")
     
     # Convert to DataFrame
-    if all_results:
-        return pd.DataFrame(all_results)
+    if results:
+        return pd.DataFrame(results)
     else:
         return pd.DataFrame()
 
-# Function to analyze all tweets with parallel processing
-def analyze_all_tweets_with_parallel_llm(organized_tweets, client: OpenAI, max_workers=8):
-    """
-    Analyze all organized tweets with parallel LLM processing for improved efficiency.
-    """
-    # Create a flat list of all tweets for processing
+# Function for enhanced analysis with LLM using parallel processing
+def analyze_all_tweets_with_parallel_llm(organized_tweets, client: OpenAI, max_workers=8, custom_prompt: str | None = None):
+    """Analyze all organized tweets with parallel LLM processing. Requires an OpenAI client instance."""
+    print("\nRunning parallel LLM analysis on ALL tweets...")
+
+    if not organized_tweets:
+        print("No organized tweets to analyze!")
+        return pd.DataFrame()
+
+    # Prepare list of all tweets (both parents and replies)
     all_tweets = []
-    
-    for conversation_id, conversation in organized_tweets:
-        # Add the parent tweet
-        parent = conversation['tweet']
+
+    for thread in organized_tweets:
+        # Add parent tweet with a type indicator
+        parent = thread['tweet']
+        parent['is_parent'] = True
         all_tweets.append(parent)
-        
-        # Add all replies
-        for reply in conversation['replies']:
+
+        # Add replies with a type indicator
+        for reply in thread['replies']:
+            reply['is_parent'] = False
+            reply['in_reply_to'] = parent.get('id', '')
             all_tweets.append(reply)
-    
+
     print(f"Prepared {len(all_tweets)} tweets for parallel processing")
-    
-    # Process all tweets in parallel
+
+    # Process all tweets in parallel, passing the custom prompt and client
     start_time = time.time()
-    results_df = process_tweets_in_parallel(all_tweets, client, max_workers=max_workers)
+    results_df = process_tweets_in_parallel(all_tweets, client=client, max_workers=max_workers, prompt_to_use=custom_prompt)
     end_time = time.time()
-    
+
     # Save to CSV
     if not results_df.empty:
         output_file = 'all_tweets_llm_analysis.csv'
@@ -507,6 +522,42 @@ def analyze_all_tweets_with_parallel_llm(organized_tweets, client: OpenAI, max_w
                 print(f"{sentiment}: {count} tweets ({percentage:.1f}%)")
     
     return results_df
+
+# Re-define constant just before __main__ block as a workaround
+DEFAULT_CLASSIFICATION_PROMPT = """
+You are a financial market analyst. Analyze the given tweet and return your analysis in JSON format.
+Your response should be a valid JSON object with the following structure:
+{
+    "time_horizon": "intraday/daily/weekly/short_term/medium_term/long_term/unknown",
+    "trade_type": "trade_suggestion/analysis/news/general_discussion/unknown",
+    "sentiment": "bullish/bearish/neutral"
+}
+
+Guidelines for classification:
+1. Time horizon:
+   - intraday: within the same trading day or mentions "today"
+   - daily: 1-5 trading days, mentions "tomorrow", "next day", or this week
+   - weekly: 1-4 weeks, mentions "next week" or specific dates within a month
+   - short_term: 1-3 months, mentions "next month", " next quarter"
+   - medium_term: 3-6 months, mentions "quarter", or "Q1/Q2/Q3/Q4, "end of year"
+   - long_term: >6 months, mentions "next year" or longer timeframes
+   - unknown: if not specified
+   
+   IMPORTANT: Pay close attention to time-related words like "today", "tomorrow", "next week", etc.
+   If the tweet mentions earnings or events happening "tomorrow", classify as "daily".
+
+2. Type of content:
+   - trade_suggestion: specific entry/exit points or direct trade recommendations
+   - analysis: market analysis, chart patterns, fundamentals
+   - news: market news, company updates, economic data, earnings announcements
+   - general_discussion: general market talk
+   - unknown: if unclear
+
+3. Market sentiment:
+   - bullish: positive outlook, expecting upward movement
+   - bearish: negative outlook, expecting downward movement
+   - neutral: balanced view or no clear direction
+"""
 
 # This code will only run when the script is executed directly, not when imported
 if __name__ == "__main__":
@@ -557,12 +608,18 @@ if __name__ == "__main__":
              # Fallback or error if key not found for standalone run
              # For testing, you could hardcode temporarily, but avoid committing it
              print("Warning: OPENAI_API_KEY environment variable not set for standalone run.")
-             # standalone_api_key = "your_temp_key_for_local_test_only" 
+             # standalone_api_key = "your_temp_key_for_local_test_only"
              # For now, let's raise an error if not set
              raise ValueError("API key needed for standalone execution")
              
         standalone_client = OpenAI(api_key=standalone_api_key)
-        all_results = analyze_all_tweets_with_parallel_llm(organized_tweets, standalone_client, max_workers=MAX_WORKERS)
+        # Pass the client and the default prompt for the example run
+        all_results = analyze_all_tweets_with_parallel_llm(
+            organized_tweets, 
+            client=standalone_client, 
+            max_workers=MAX_WORKERS, 
+            custom_prompt=DEFAULT_CLASSIFICATION_PROMPT
+        )
     except Exception as main_exec_err:
          print(f"Error during standalone execution: {main_exec_err}")
          all_results = pd.DataFrame() # Ensure all_results is defined
