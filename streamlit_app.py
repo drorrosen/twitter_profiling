@@ -2005,6 +2005,13 @@ def create_data_extraction_dashboard():
     
     process_col, upload_col = st.columns(2)
     
+    # --- Workaround to show processing options without running extraction ---
+    if st.session_state.twitter_data is None:
+        st.warning("⚠️ Displaying processing options using placeholder data. Run 'Start Tweet Extraction' to load real data before processing.")
+        # Create a minimal dummy DataFrame to allow the UI section to render
+        st.session_state.twitter_data = pd.DataFrame([{'id': '0', 'text': 'Placeholder tweet for UI preview only.'}])
+    # --- End Workaround ---
+    
     with process_col:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown("<h3 style='color: #1DA1F2; margin-bottom: 15px;'>Process Tweets</h3>", unsafe_allow_html=True)
@@ -2040,15 +2047,43 @@ def create_data_extraction_dashboard():
             - More workers = faster processing but higher resource usage
             - Recommended: 4-8 workers for most systems
             """)
+
+            # --- Add LLM Prompt Editor ---
+            st.markdown("#### Edit LLM Analysis Prompt")
+            # Import the default prompt from the optimized module
+            try:
+                # Ensure the module is loaded and the constant exists
+                if hasattr(twitter_llm_module, 'DEFAULT_CLASSIFICATION_PROMPT'):
+                    DEFAULT_PROMPT = twitter_llm_module.DEFAULT_CLASSIFICATION_PROMPT
+                else:
+                    st.error("DEFAULT_CLASSIFICATION_PROMPT not found in twitter_llms_optimized.py!")
+                    DEFAULT_PROMPT = "Error: Prompt not found."
+                
+                # Display the text area, pre-filled with the default prompt
+                edited_prompt = st.text_area(
+                    "LLM Prompt", 
+                    value=DEFAULT_PROMPT, 
+                    height=300, 
+                    key="llm_prompt_editor",
+                    help="Modify the prompt used for LLM tweet analysis. The model expects a JSON output with keys: time_horizon, trade_type, sentiment."
+                )
+            except Exception as import_err: # Catch potential import or access errors
+                st.error(f"Could not load default prompt: {import_err}")
+                edited_prompt = "" # Set empty prompt on error
+            # --- End LLM Prompt Editor ---
             
-            if st.button("🧠 Process with LLM", use_container_width=True, disabled=not openai_api_key):
+            # Use the state of the edited_prompt for the disabled check
+            is_prompt_valid = edited_prompt and edited_prompt != "Error: Prompt not found."
+            if st.button("🧠 Process with LLM", use_container_width=True, disabled=not openai_api_key or not is_prompt_valid):
                 if not openai_api_key:
                     st.error("Please enter your OpenAI API key to continue.")
+                elif not is_prompt_valid:
+                    st.error("LLM prompt cannot be empty or load correctly.")
                 else:
                     try:
                         if 'twitter_data' not in st.session_state or st.session_state.twitter_data is None:
                             st.error("❌ No data in session state! Please run extraction first.")
-                            return
+                            st.stop() # Stop execution if no data
                         
                         # Ensure data is DataFrame
                         if isinstance(st.session_state.twitter_data, pd.DataFrame):
@@ -2057,23 +2092,27 @@ def create_data_extraction_dashboard():
                             df = pd.DataFrame(st.session_state.twitter_data)
                         else:
                             st.error("❌ Invalid data format in session state! Please re-run extraction.")
-                            return
+                            st.stop() # Stop execution
 
                         progress_bar = st.progress(0)
                         status_text = st.empty()
                         
                         import openai
-                        client = openai.OpenAI(api_key=openai_api_key)
+                        # Create client inside the button click to use the latest key
+                        client = openai.OpenAI(api_key=openai_api_key) 
                         
+                        # Retrieve settings from session state when the button is clicked
                         num_workers = st.session_state.get("num_workers", 8)
+                        current_prompt = st.session_state.llm_prompt_editor 
                         
-                        def process_tweet_fully(original_tweet_data):
+                        # --- Modify process_tweet_fully to accept prompt ---
+                        def process_tweet_fully(original_tweet_data, prompt_to_use):
                             try:
                                 tweet_text = original_tweet_data.get('text', '')
                                 author = original_tweet_data.get('author_userName', original_tweet_data.get('authorUsername', ''))
 
-                                # 1. LLM Classification - Pass the client
-                                analysis = twitter_llm_module.classify_tweet_with_llm(tweet_text, client)
+                                # 1. LLM Classification - Pass the prompt
+                                analysis = twitter_llm_module.classify_tweet_with_llm(tweet_text, custom_prompt=prompt_to_use)
 
                                 # 2. Regex Tickers - Use correct module
                                 regex_tickers = twitter_llm_module.extract_tickers_regex(tweet_text)
@@ -2083,7 +2122,7 @@ def create_data_extraction_dashboard():
                                 if author == 'Jedi_ant':
                                     # Simplified mapping for example
                                     if 'china' in tweet_text.lower():
-                                        enriched_tickers.update(['KTEC', 'FXI'])
+                                        enriched_tickers.update(['KTEC', 'FXI']) 
                                         
                                 final_tickers_str = ', '.join(sorted(list(enriched_tickers)))
 
@@ -2099,6 +2138,12 @@ def create_data_extraction_dashboard():
                                 combined_result['like_count'] = original_tweet_data.get('likeCount', original_tweet_data.get('like_count', 0))
                                 combined_result['retweet_count'] = original_tweet_data.get('retweetCount', original_tweet_data.get('retweet_count', 0))
                                 
+                                # Add other necessary fields if they exist in original_tweet_data
+                                other_cols = ['conversationId', 'inReplyToId', 'author_id', 'author_verified', 'author_blue_verified', 'author_followers', 'author_following', 'views']
+                                for col in other_cols:
+                                     if col in original_tweet_data:
+                                          combined_result[col] = original_tweet_data[col]
+                                          
                                 return combined_result
 
                             except Exception as e:
@@ -2108,8 +2153,16 @@ def create_data_extraction_dashboard():
                                 failed_result['time_horizon'] = 'error'
                                 failed_result['trade_type'] = 'error'
                                 failed_result['sentiment'] = 'error'
-                                failed_result['tickers_mentioned'] = ', '.join(twitter_llm_module.extract_tickers_regex(failed_result.get('text','')))
+                                failed_result['tickers_mentioned'] = ', '.join(twitter_llm_module.extract_tickers_regex(failed_result.get('text',''))) 
+                                # Ensure core fields are present even on failure
+                                failed_result['tweet_id'] = original_tweet_data.get('id', '')
+                                failed_result['author'] = original_tweet_data.get('author_userName', original_tweet_data.get('authorUsername', ''))
+                                failed_result['created_at'] = original_tweet_data.get('createdAt', original_tweet_data.get('created_at', ''))
+                                failed_result['text'] = original_tweet_data.get('text', '')
+                                failed_result['like_count'] = original_tweet_data.get('likeCount', original_tweet_data.get('like_count', 0))
+                                failed_result['retweet_count'] = original_tweet_data.get('retweetCount', original_tweet_data.get('retweet_count', 0))
                                 return failed_result
+                        # --- End modification ---
                         
                         import concurrent.futures
                         import time
@@ -2118,39 +2171,41 @@ def create_data_extraction_dashboard():
                         tweets_to_process = df.to_dict('records')
                         total_tweets = len(tweets_to_process)
                         
-                        status_text.text(f"Processing {total_tweets} tweets with {num_workers} workers...")
+                        status_text.text(f"Processing {total_tweets} tweets with {num_workers} workers using the provided prompt...")
                         
                         start_time = time.time()
                         processed_tweets = []
                         completed = 0
                         
                         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-                            # Submit tasks using the new full processing helper function
-                            future_to_tweet = {executor.submit(process_tweet_fully, tweet): tweet 
+                            # Submit tasks using the modified full processing helper function, passing the prompt
+                            future_to_tweet = {executor.submit(process_tweet_fully, tweet, current_prompt): tweet 
                                               for tweet in tweets_to_process}
                             
                             for future in concurrent.futures.as_completed(future_to_tweet):
-                                # original_tweet_data = future_to_tweet[future] # No longer needed here
                                 try:
-                                    processed_result = future.result() # Result already has combined data
-                                    if processed_result: # Check if result is not None
+                                    processed_result = future.result()
+                                    if processed_result:
                                          processed_tweets.append(processed_result)
                                     else:
-                                         # Handle case where processing function returned None (should have returned dict)
                                          print(f"Warning: Processing returned None for a tweet.") 
-                                         # Optionally append original data or skip
-                                         # processed_tweets.append(future_to_tweet[future]) 
                                          
                                 except Exception as exc:
-                                    # This catches errors during future.result() itself, though inner errors are handled in process_tweet_fully
                                     original_data = future_to_tweet[future]
                                     print(f'Future for tweet {original_data.get("id", "unknown")} generated an exception: {exc}')
-                                    # Append original data with error flags as fallback
+                                    # Create a failed result record to maintain row count and mark error
                                     failed_result = original_data.copy()
                                     failed_result['time_horizon'] = 'future_error'
                                     failed_result['trade_type'] = 'future_error'
                                     failed_result['sentiment'] = 'future_error'
                                     failed_result['tickers_mentioned'] = ', '.join(twitter_llm_module.extract_tickers_regex(failed_result.get('text','')))
+                                    # Ensure core fields are present
+                                    failed_result['tweet_id'] = original_data.get('id', '')
+                                    failed_result['author'] = original_data.get('author_userName', original_data.get('authorUsername', ''))
+                                    failed_result['created_at'] = original_data.get('createdAt', original_data.get('created_at', ''))
+                                    failed_result['text'] = original_data.get('text', '')
+                                    failed_result['like_count'] = original_data.get('likeCount', original_data.get('like_count', 0))
+                                    failed_result['retweet_count'] = original_data.get('retweetCount', original_data.get('retweet_count', 0))
                                     processed_tweets.append(failed_result)
 
                                 completed += 1
@@ -2167,6 +2222,11 @@ def create_data_extraction_dashboard():
                                         f"Est. remaining: {int(remaining)} seconds"
                                     )
                         
+                        # Check if processed_tweets is empty before creating DataFrame
+                        if not processed_tweets:
+                            st.warning("No tweets were successfully processed.")
+                            st.stop()
+                            
                         processed_df = pd.DataFrame(processed_tweets)
                         
                         st.session_state.processed_data = processed_df
@@ -2174,10 +2234,11 @@ def create_data_extraction_dashboard():
                         progress_bar.empty()
                         
                         elapsed_time = time.time() - start_time
-                        st.success(f"✅ Successfully processed {len(processed_df)} tweets in {elapsed_time:.1f} seconds!")
+                        st.success(f"✅ Successfully processed {len(processed_df)} tweets in {elapsed_time:.1f} seconds using the provided prompt!")
                         
                         st.write("### Processed Tweets Preview")
-                        preview_columns = ['text', 'sentiment', 'time_horizon', 'trade_type']
+                        # Show common LLM output columns + text
+                        preview_columns = ['text', 'sentiment', 'time_horizon', 'trade_type', 'tickers_mentioned']
                         available_cols = [col for col in preview_columns if col in processed_df.columns]
                         st.dataframe(processed_df[available_cols].head())
                         
